@@ -8,12 +8,17 @@ import {
   getProjectProfileByTelegramId,
   getProjectProfileByTelegramUsername,
   getApplicableInstructions,
+  getLatestProjectChatContext,
+  getLatestSuggestionContextForAdmin,
+  getLatestTeamChatContext,
   getPendingSuggestionByClientMessage,
   getRecentConversationForProject,
   getRecentKnowledgeForProject,
   getRecentApprovedReplies,
   getRecentConversation,
+  searchApprovedReplyExamples,
   searchProjectConversationSnippets,
+  searchConversationSnippetsByChat,
   searchConversationSnippets,
   isTeamMember,
   linkProjectChat,
@@ -24,16 +29,21 @@ import {
 } from './db.js';
 import { embedText } from './embed.js';
 import { notifyTeamAboutSuggestion, markSuggestionCardsHandled } from './notifications.js';
-import { getProjectProfileForUser, getRelevantKnowledge } from './rag.js';
+import { findPartnerCandidates, getProjectProfileForUser, getRelevantKnowledge } from './rag.js';
 import { buildChatLink, displayName, normalizeTelegramUsername, parseLocalDateTimeInput, sha256 } from './utils.js';
-import { generateBDSuggestion, generateTeamResearchAnswer } from './ai.js';
+import {
+  extractAnnouncementReminderCandidate,
+  generateBDSuggestion,
+  generatePartnerRecommendations,
+  generateTeamResearchAnswer,
+} from './ai.js';
+import { syncProjectProfileForTelegramUser } from './sheets.js';
 
 export async function handleIncomingMessage(ctx) {
-  const message = ctx.message;
+  const message = ctx.message || ctx.channelPost || ctx.update?.channel_post || ctx.update?.edited_message || ctx.update?.edited_channel_post;
   const text = extractMessageContent(message);
-  const sender = resolveMessageSender(message);
 
-  if (!text || sender.isBot) {
+  if (!message || !text || message.from?.is_bot) {
     return;
   }
 
@@ -41,14 +51,20 @@ export async function handleIncomingMessage(ctx) {
     return;
   }
 
-  const senderId = sender.id;
-  const senderIsTeamMember = isTeamMember(senderId);
+  const sender = resolveSenderContext(message);
+  if (!sender.senderId) {
+    return;
+  }
+  const senderId = sender.senderId;
+  const senderIsTeamMember = sender.isTeamMember;
+  const messageId = message.message_id;
 
   if (ctx.chat.type === 'private') {
     if (senderIsTeamMember && !RESERVED_PRIVATE_TEXTS.has(text)) {
       queueBackgroundTask('team private question', () => handleTeamPrivateQuestion({
         telegram: ctx.telegram,
         chatId: ctx.chat.id,
+        operatorId: senderId,
         operatorQuestion: text,
       }));
     }
@@ -64,8 +80,8 @@ export async function handleIncomingMessage(ctx) {
     telegramMessageId: message.message_id,
     replyToMessageId: message.reply_to_message?.message_id || null,
     senderId,
-    senderName: sender.name,
-    senderUsername: sender.username || '',
+    senderName: sender.senderName,
+    senderUsername: sender.senderUsername,
     senderRole: senderIsTeamMember ? 'team' : 'project',
     messageText: text,
     messageDateIso: new Date(message.date * 1000).toISOString(),
@@ -74,17 +90,17 @@ export async function handleIncomingMessage(ctx) {
   if (senderIsTeamMember) {
     queueBackgroundTask('announcement candidate', () => maybeCaptureAnnouncementCandidate({
       senderId,
-      senderUsername: sender.username || '',
+      senderUsername: sender.senderUsername,
       chatId: ctx.chat.id,
       chatTitle,
-      chatLink: buildChatLink(ctx.chat, ctx.message.message_id),
+      chatLink: buildChatLink(ctx.chat, messageId),
       messageText: text,
     }));
     queueBackgroundTask('capture actual reply', () => maybeCaptureActualReply({
       chatId: ctx.chat.id,
       messageFromId: senderId,
-      actorName: sender.name,
-      replyToMessage: ctx.message.reply_to_message,
+      actorName: sender.senderName,
+      replyToMessage: message.reply_to_message,
       actualReplyText: text,
       telegram: ctx.telegram,
     }));
@@ -94,12 +110,12 @@ export async function handleIncomingMessage(ctx) {
   queueBackgroundTask('project message', () => handleProjectMessage({
     telegram: ctx.telegram,
     clientId: senderId,
-    clientUsername: sender.username || '',
-    clientName: sender.name,
+    clientUsername: sender.senderUsername,
+    clientName: sender.senderName,
     chatId: ctx.chat.id,
     chatTitle,
-    chatLink: buildChatLink(ctx.chat, ctx.message.message_id),
-    clientMessageId: ctx.message.message_id,
+    chatLink: buildChatLink(ctx.chat, messageId),
+    clientMessageId: messageId,
     clientText: text,
   }));
 }
@@ -120,10 +136,15 @@ async function handleProjectMessage({
   const priorTeamMessages = priorHistory.filter((entry) => entry.sender_role === 'team').length;
   const priorProjectMessages = priorHistory.filter((entry) => entry.sender_role === 'project').length;
   const isNewConversation = priorTeamMessages === 0 && priorProjectMessages <= 1;
-  const projectProfile = getProjectProfileForUser({
+  let projectProfile = getProjectProfileForUser({
     telegramUserId: clientId,
     telegramUsername: clientUsername,
     chatId,
+  });
+  projectProfile = await maybeRefreshProjectProfile({
+    projectProfile,
+    telegramUserId: clientId,
+    telegramUsername: clientUsername,
   });
   if (projectProfile) {
     linkProjectIdentity({
@@ -134,15 +155,29 @@ async function handleProjectMessage({
       senderUsername: clientUsername,
     });
   }
-  const projectConversationMemory = priorHistory.slice(-18);
+  const projectConversationMemory = dedupeConversationSnippets([
+    ...searchConversationSnippetsByChat(chatId, clientText, 12),
+    ...getRecentConversation(chatId, 80),
+  ], 18);
   const projectMemoryProjectId = resolveProjectKnowledgeId(projectProfile, clientId);
-  const projectMemory = getRecentKnowledgeForProject(
-    projectMemoryProjectId,
-    10,
-    projectProfile?.telegram_username || clientUsername
+  const projectMemory = filterKnowledgeEntriesForChat(
+    getRecentKnowledgeForProject(
+      projectMemoryProjectId,
+      20,
+      projectProfile?.telegram_username || clientUsername
+    ),
+    chatId,
+    10
   );
-  const { knowledge } = await getRelevantKnowledge(clientText, 6);
-  const approvedExamples = getRecentApprovedReplies(5);
+  const { knowledge: matchedKnowledge } = await getRelevantKnowledge(clientText, 20);
+  const knowledge = filterKnowledgeEntriesForChat(matchedKnowledge, chatId, 6);
+  const approvedExamples = getRecentApprovedReplies(20)
+    .filter((entry) => Number(entry.chat_id) === Number(chatId))
+    .slice(0, 5);
+  const generalReplyPatterns = searchApprovedReplyExamples(clientText, {
+    limit: 6,
+    excludeChatId: chatId,
+  });
   const operatorInstructions = getApplicableInstructions({
     projectTelegramUserId: projectProfile?.telegram_user_id || clientId,
     projectTelegramUsername: projectProfile?.telegram_username || clientUsername,
@@ -156,6 +191,7 @@ async function handleProjectMessage({
     projectConversationMemory,
     knowledge,
     approvedExamples,
+    generalReplyPatterns,
     operatorInstructions,
   });
 
@@ -188,30 +224,55 @@ async function handleProjectMessage({
 async function handleTeamPrivateQuestion({
   telegram,
   chatId,
+  operatorId,
   operatorQuestion,
 }) {
   const matchedProfiles = resolveMatchedProfiles(operatorQuestion);
-  const primaryProfile = matchedProfiles[0] || null;
-  const projectConversationSnippets = primaryProfile ? dedupeConversationSnippets([
-    ...searchProjectConversationSnippets({
-      projectTelegramUserId: primaryProfile.telegram_user_id,
-      projectTelegramUsername: primaryProfile.telegram_username,
-      query: operatorQuestion,
-      limit: 10,
-    }),
-    ...getRecentConversationForProject({
-      projectTelegramUserId: primaryProfile.telegram_user_id,
-      projectTelegramUsername: primaryProfile.telegram_username,
-      limit: 12,
-    }),
-  ], 12) : [];
+  const inferredContext = inferOperatorProjectContext(operatorId);
+  const explicitPrimaryProfile = matchedProfiles[0] || null;
+  const primaryProfile = explicitPrimaryProfile || inferredContext?.projectProfile || null;
+  const resolvedMatchedProfiles = primaryProfile
+    ? dedupeProfiles([primaryProfile, ...matchedProfiles], 3)
+    : matchedProfiles;
+  const focusChatContext = resolveFocusChatContext({
+    primaryProfile,
+    inferredContext,
+  });
+
+  const projectConversationSnippets = primaryProfile
+    ? dedupeConversationSnippets(
+        focusChatContext?.chatId
+          ? [
+              ...searchConversationSnippetsByChat(focusChatContext.chatId, operatorQuestion, 10),
+              ...getRecentConversation(focusChatContext.chatId, 24),
+            ]
+          : [
+              ...searchProjectConversationSnippets({
+                projectTelegramUserId: primaryProfile.telegram_user_id,
+                projectTelegramUsername: primaryProfile.telegram_username,
+                query: operatorQuestion,
+                limit: 10,
+              }),
+              ...getRecentConversationForProject({
+                projectTelegramUserId: primaryProfile.telegram_user_id,
+                projectTelegramUsername: primaryProfile.telegram_username,
+                limit: 12,
+              }),
+            ],
+        12
+      )
+    : [];
   const derivedProjectSenderId = projectConversationSnippets.find((entry) => entry.sender_role === 'project')?.sender_id
     || (primaryProfile?.telegram_user_id > 0 ? primaryProfile.telegram_user_id : null);
   const relevantProjectMemory = derivedProjectSenderId
-    ? getRecentKnowledgeForProject(
-        derivedProjectSenderId,
-        8,
-        primaryProfile?.telegram_username || ''
+    ? filterKnowledgeEntriesForChat(
+        getRecentKnowledgeForProject(
+          derivedProjectSenderId,
+          20,
+          primaryProfile?.telegram_username || ''
+        ),
+        focusChatContext?.chatId || null,
+        8
       )
     : [];
   const conversationSnippets = dedupeConversationSnippets([
@@ -219,22 +280,53 @@ async function handleTeamPrivateQuestion({
     ...projectConversationSnippets,
   ], 12);
   const { knowledge } = await getRelevantKnowledge(operatorQuestion, 8);
+  const filteredKnowledge = focusChatContext?.chatId
+    ? filterKnowledgeEntriesForChat(knowledge, focusChatContext.chatId, 8)
+    : knowledge;
+  const explicitApprovedExamples = focusChatContext?.chatId
+    ? getRecentApprovedReplies(20)
+        .filter((entry) => Number(entry.chat_id) === Number(focusChatContext.chatId))
+        .slice(0, 6)
+    : [];
+  const generalReplyPatterns = searchApprovedReplyExamples(operatorQuestion, {
+    limit: 6,
+    excludeChatId: focusChatContext?.chatId || null,
+  });
   const approvedExamples = getRecentApprovedReplies(6);
   const projectInstructions = getApplicableInstructions({
     projectTelegramUserId: primaryProfile?.telegram_user_id || null,
     projectTelegramUsername: primaryProfile?.telegram_username || '',
   });
 
+  if (primaryProfile && /\bpartner|partners|collaborate|collaboration|synergy|synergies\b/i.test(operatorQuestion)) {
+    const partnerCandidates = await findPartnerCandidates(primaryProfile, 5);
+    if (partnerCandidates.length) {
+      const recommendation = await generatePartnerRecommendations({
+        targetProfile: primaryProfile,
+        candidates: partnerCandidates,
+      });
+
+      await telegram.sendMessage(chatId, recommendation, {
+        disable_web_page_preview: true,
+      });
+      return;
+    }
+  }
+
   const result = await generateTeamResearchAnswer({
     operatorQuestion,
-    matchedProfiles,
+    matchedProfiles: resolvedMatchedProfiles,
     projectInstructions,
     conversationSnippets,
     relevantKnowledge: dedupeKnowledgeEntries([
       ...relevantProjectMemory,
-      ...knowledge,
+      ...filteredKnowledge,
     ], 12),
-    approvedExamples,
+    approvedExamples: dedupeApprovedExamples([
+      ...explicitApprovedExamples,
+      ...approvedExamples,
+    ], 6),
+    generalReplyPatterns,
   });
 
   await telegram.sendMessage(chatId, formatTeamResearchResult(result), {
@@ -305,9 +397,33 @@ async function maybeCaptureAnnouncementCandidate({
   messageText,
   projectProfile = null,
 }) {
-  const candidate = extractAnnouncementCandidate(messageText);
+  let candidate = extractAnnouncementCandidate(messageText);
   if (!candidate) {
-    return;
+    if (!looksLikeTimelineMessage(messageText)) {
+      return;
+    }
+
+    const resolvedProject = projectProfile || getProjectProfileForUser({
+      telegramUserId: senderId,
+      telegramUsername: senderUsername,
+      chatId,
+    });
+    const aiCandidate = await extractAnnouncementReminderCandidate({
+      messageText,
+      projectProfile: resolvedProject,
+    });
+    if (aiCandidate.shouldCreateReminder) {
+      const parsedDateTime = parseLocalDateTimeInput(aiCandidate.localDateTime);
+      if (parsedDateTime) {
+        candidate = {
+          announcementAt: parsedDateTime,
+          announcementText: aiCandidate.reminderText || compactAnnouncementText(messageText),
+        };
+      }
+    }
+    if (!candidate) {
+      return;
+    }
   }
 
   const resolvedProject = projectProfile || getProjectProfileForUser({
@@ -391,6 +507,76 @@ function dedupeKnowledgeEntries(items, limit) {
   return output;
 }
 
+function filterKnowledgeEntriesForChat(items, chatId, limit) {
+  const seen = new Set();
+  const output = [];
+  const hasChatFilter = chatId != null && chatId !== '';
+  const normalizedChatId = hasChatFilter ? Number(chatId) : null;
+
+  for (const item of items || []) {
+    const itemChatId = item?.chat_id == null ? null : Number(item.chat_id);
+    if (hasChatFilter && itemChatId !== null && itemChatId !== normalizedChatId) {
+      continue;
+    }
+
+    const key = item.external_key || `${item.scope}:${item.content}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    output.push(item);
+    if (output.length >= limit) {
+      break;
+    }
+  }
+
+  return output;
+}
+
+function dedupeApprovedExamples(items, limit) {
+  const seen = new Set();
+  const output = [];
+
+  for (const item of items || []) {
+    const key = item.id || `${item.chat_id}:${item.client_text}:${item.actual_reply_text}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(item);
+    if (output.length >= limit) {
+      break;
+    }
+  }
+
+  return output;
+}
+
+function dedupeProfiles(items, limit) {
+  const seen = new Set();
+  const output = [];
+
+  for (const item of items || []) {
+    if (!item) {
+      continue;
+    }
+
+    const key = `${item.telegram_user_id}:${item.project_name || ''}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    output.push(item);
+    if (output.length >= limit) {
+      break;
+    }
+  }
+
+  return output;
+}
+
 function formatTeamResearchResult(result) {
   const lines = [
     result.answer,
@@ -454,37 +640,118 @@ function resolveMatchedProfiles(operatorQuestion) {
   }
 }
 
+function resolveSenderContext(message) {
+  const fromUser = message?.from || null;
+  const senderChat = message?.sender_chat || null;
+  const senderId = Number(fromUser?.id || senderChat?.id || 0);
+  const senderName = fromUser
+    ? displayName(fromUser)
+    : (senderChat?.title || senderChat?.username || `Chat ${senderId}`);
+  const senderUsername = fromUser?.username || senderChat?.username || '';
+
+  return {
+    senderId,
+    senderName,
+    senderUsername,
+    isTeamMember: fromUser ? isTeamMember(senderId) : false,
+  };
+}
+
+function inferOperatorProjectContext(operatorId) {
+  if (!operatorId) {
+    return null;
+  }
+
+  const latestTeamChat = getLatestTeamChatContext(operatorId);
+  if (latestTeamChat) {
+    const projectProfile = getProjectProfileForUser({
+      telegramUserId: null,
+      telegramUsername: '',
+      chatId: latestTeamChat.chat_id,
+    });
+
+    if (projectProfile) {
+      return {
+        projectProfile,
+        chatId: latestTeamChat.chat_id,
+        chatTitle: latestTeamChat.chat_title,
+        source: 'latest_team_group_message',
+      };
+    }
+  }
+
+  const latestSuggestion = getLatestSuggestionContextForAdmin(operatorId);
+  if (!latestSuggestion) {
+    return null;
+  }
+
+  const projectProfile = getProjectProfileForUser({
+    telegramUserId: latestSuggestion.client_sender_id,
+    telegramUsername: '',
+    chatId: latestSuggestion.chat_id,
+  });
+
+  if (!projectProfile) {
+    return null;
+  }
+
+  return {
+    projectProfile,
+    chatId: latestSuggestion.chat_id,
+    chatTitle: latestSuggestion.chat_title,
+    source: 'latest_delivered_suggestion',
+  };
+}
+
+function resolveFocusChatContext({ primaryProfile, inferredContext }) {
+  if (!primaryProfile) {
+    return null;
+  }
+
+  if (inferredContext?.projectProfile?.telegram_user_id === primaryProfile.telegram_user_id) {
+    return inferredContext;
+  }
+
+  const latestChat = getLatestProjectChatContext({
+    projectTelegramUserId: primaryProfile.telegram_user_id,
+    projectTelegramUsername: primaryProfile.telegram_username,
+  });
+
+  if (!latestChat) {
+    return null;
+  }
+
+  return {
+    projectProfile: primaryProfile,
+    chatId: latestChat.chat_id,
+    chatTitle: latestChat.chat_title,
+    source: 'latest_project_chat',
+  };
+}
+
 function extractMessageContent(message) {
   const text = String(message?.text || message?.caption || '').trim();
   const attachmentSummary = buildAttachmentSummary(message);
   return [text, attachmentSummary].filter(Boolean).join('\n').trim();
 }
 
-function resolveMessageSender(message) {
-  if (message?.from) {
-    return {
-      id: Number(message.from.id),
-      username: message.from.username || '',
-      name: displayName(message.from),
-      isBot: Boolean(message.from.is_bot),
-    };
-  }
+async function maybeRefreshProjectProfile({
+  projectProfile,
+  telegramUserId,
+  telegramUsername,
+}) {
+  try {
+    const refreshed = await syncProjectProfileForTelegramUser({
+      telegramUserId,
+      telegramUsername,
+      force: !projectProfile,
+    });
 
-  if (message?.sender_chat) {
-    return {
-      id: Number(message.sender_chat.id),
-      username: message.sender_chat.username || '',
-      name: message.sender_chat.title || message.sender_chat.username || `Chat_${message.sender_chat.id}`,
-      isBot: false,
-    };
+    return refreshed || projectProfile;
+  } catch (error) {
+    console.warn('Realtime project profile sync failed:', error.message);
+    return projectProfile;
   }
-
-  return {
-    id: 0,
-    username: '',
-    name: 'Unknown sender',
-    isBot: false,
-  };
 }
 
 function buildAttachmentSummary(message) {
@@ -539,6 +806,10 @@ function extractAnnouncementCandidate(messageText) {
 
 function compactAnnouncementText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+}
+
+function looksLikeTimelineMessage(text) {
+  return /\b(announcement|announce|ama|listing|launch|event|timeline|going live|mainnet|airdrop|tomorrow|today|next week|utc|ist|pm|am|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i.test(String(text || ''));
 }
 
 function linkProjectIdentity({

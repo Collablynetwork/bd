@@ -178,6 +178,18 @@ export function initDb() {
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     );
 
+    CREATE TABLE IF NOT EXISTS source_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_key TEXT NOT NULL UNIQUE,
+      source_type TEXT NOT NULL,
+      title TEXT,
+      content_text TEXT,
+      content_json TEXT,
+      metadata_json TEXT,
+      refreshed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_conversations_chat_id ON conversations(chat_id, message_date_iso);
     CREATE INDEX IF NOT EXISTS idx_conversations_sender_id ON conversations(sender_id, message_date_iso);
     CREATE INDEX IF NOT EXISTS idx_suggestions_due ON suggestions(status, next_reminder_at);
@@ -187,6 +199,7 @@ export function initDb() {
     CREATE INDEX IF NOT EXISTS idx_project_aliases_lookup ON project_aliases(alias_type, alias_value, active);
     CREATE INDEX IF NOT EXISTS idx_project_chat_links_lookup ON project_chat_links(chat_id, active);
     CREATE INDEX IF NOT EXISTS idx_suggestion_reviews_lookup ON suggestion_reviews(suggestion_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_source_snapshots_type ON source_snapshots(source_type, refreshed_at);
   `);
 
   ensureColumn('project_profiles', 'telegram_username', 'TEXT');
@@ -416,6 +429,73 @@ export function deactivateKnowledgeItem(knowledgeId) {
   `).run(knowledgeId);
 
   return result.changes > 0;
+}
+
+export function upsertSourceSnapshot({
+  sourceKey,
+  sourceType,
+  title = '',
+  contentText = '',
+  contentJson = null,
+  metadata = null,
+}) {
+  db.prepare(`
+    INSERT INTO source_snapshots (
+      source_key,
+      source_type,
+      title,
+      content_text,
+      content_json,
+      metadata_json,
+      refreshed_at,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(source_key) DO UPDATE SET
+      source_type = excluded.source_type,
+      title = excluded.title,
+      content_text = excluded.content_text,
+      content_json = excluded.content_json,
+      metadata_json = excluded.metadata_json,
+      refreshed_at = excluded.refreshed_at
+  `).run(
+    sourceKey,
+    sourceType,
+    title || '',
+    contentText || '',
+    contentJson ? jsonStringify(contentJson) : null,
+    metadata ? jsonStringify(metadata) : null,
+    nowIso(),
+    nowIso()
+  );
+}
+
+export function getSourceSnapshot(sourceKey) {
+  const row = db.prepare(`
+    SELECT *
+    FROM source_snapshots
+    WHERE source_key = ?
+  `).get(sourceKey);
+
+  return row ? hydrateSourceSnapshot(row) : null;
+}
+
+export function listSourceSnapshots(sourceType = '', limit = 100) {
+  const rows = sourceType
+    ? db.prepare(`
+        SELECT *
+        FROM source_snapshots
+        WHERE source_type = ?
+        ORDER BY refreshed_at DESC, id DESC
+        LIMIT ?
+      `).all(sourceType, limit)
+    : db.prepare(`
+        SELECT *
+        FROM source_snapshots
+        ORDER BY refreshed_at DESC, id DESC
+        LIMIT ?
+      `).all(limit);
+
+  return rows.map(hydrateSourceSnapshot);
 }
 
 export function addOperatorInstruction({
@@ -662,6 +742,41 @@ export function getRecentConversation(chatId, limit = 12) {
     ORDER BY message_date_iso DESC, id DESC
     LIMIT ?
   `).all(chatId, limit);
+
+  return rows.reverse();
+}
+
+export function searchConversationSnippetsByChat(chatId, query, limit = 12) {
+  if (!chatId) {
+    return [];
+  }
+
+  const tokens = buildSearchTokens(query).slice(0, 5);
+  if (!tokens.length) {
+    return getRecentConversation(chatId, limit);
+  }
+
+  const clauses = [];
+  const params = [chatId];
+  for (const token of tokens) {
+    const likeValue = `%${token}%`;
+    clauses.push(`
+      LOWER(COALESCE(message_text, '')) LIKE ?
+      OR LOWER(COALESCE(chat_title, '')) LIKE ?
+      OR LOWER(COALESCE(sender_name, '')) LIKE ?
+      OR LOWER(COALESCE(sender_username, '')) LIKE ?
+    `);
+    params.push(likeValue, likeValue, likeValue, likeValue);
+  }
+
+  const rows = db.prepare(`
+    SELECT *
+    FROM conversations
+    WHERE chat_id = ?
+      AND (${clauses.map((clause) => `(${clause})`).join(' OR ')})
+    ORDER BY message_date_iso DESC, id DESC
+    LIMIT ?
+  `).all(...params, limit);
 
   return rows.reverse();
 }
@@ -957,6 +1072,40 @@ export function getRecentApprovedReplies(limit = 5) {
     ORDER BY action_taken_at DESC, id DESC
     LIMIT ?
   `).all(limit);
+}
+
+export function searchApprovedReplyExamples(query, { limit = 6, excludeChatId = null } = {}) {
+  const tokens = buildSearchTokens(query).slice(0, 5);
+  if (!tokens.length) {
+    return [];
+  }
+
+  const clauses = [];
+  const params = [];
+  for (const token of tokens) {
+    const likeValue = `%${token}%`;
+    clauses.push(`
+      LOWER(COALESCE(client_text, '')) LIKE ?
+      OR LOWER(COALESCE(actual_reply_text, '')) LIKE ?
+      OR LOWER(COALESCE(ai_response, '')) LIKE ?
+      OR LOWER(COALESCE(chat_title, '')) LIKE ?
+    `);
+    params.push(likeValue, likeValue, likeValue, likeValue);
+  }
+
+  const chatClause = excludeChatId == null ? '' : 'AND chat_id != ?';
+  const rows = db.prepare(`
+    SELECT *
+    FROM suggestions
+    WHERE actual_reply_text IS NOT NULL
+      AND actual_reply_text != ''
+      ${chatClause}
+      AND (${clauses.map((clause) => `(${clause})`).join(' OR ')})
+    ORDER BY action_taken_at DESC, id DESC
+    LIMIT ?
+  `).all(...(excludeChatId == null ? params : [excludeChatId, ...params]), limit);
+
+  return rows;
 }
 
 export function hasKnowledgeExternalKey(externalKey) {
@@ -1262,6 +1411,38 @@ export function getLatestProjectChatContext({
   return row || null;
 }
 
+export function getLatestTeamChatContext(teamMemberId) {
+  if (!teamMemberId) {
+    return null;
+  }
+
+  return db.prepare(`
+    SELECT *
+    FROM conversations
+    WHERE sender_role = 'team'
+      AND sender_id = ?
+      AND chat_type != 'private'
+    ORDER BY message_date_iso DESC, id DESC
+    LIMIT 1
+  `).get(teamMemberId) || null;
+}
+
+export function getLatestSuggestionContextForAdmin(adminId) {
+  if (!adminId) {
+    return null;
+  }
+
+  return db.prepare(`
+    SELECT s.*, d.created_at AS delivery_created_at
+    FROM suggestion_deliveries d
+    JOIN suggestions s
+      ON s.id = d.suggestion_id
+    WHERE d.admin_id = ?
+    ORDER BY d.created_at DESC, d.id DESC
+    LIMIT 1
+  `).get(adminId) || null;
+}
+
 export function searchPartnerProfilesByEmbedding(queryEmbedding, excludeTelegramUserId, limit = 5, targetProfile = null) {
   const rows = db.prepare(`
     SELECT *
@@ -1442,6 +1623,11 @@ export function exportKnowledgeSnapshot() {
       FROM suggestion_reviews
       ORDER BY suggestion_id ASC, created_at ASC, id ASC
     `).all(),
+    sourceSnapshots: db.prepare(`
+      SELECT *
+      FROM source_snapshots
+      ORDER BY source_type ASC, source_key ASC
+    `).all().map(hydrateSourceSnapshot),
   };
 }
 
@@ -1503,6 +1689,55 @@ export function exportHistorySnapshot({
   };
 }
 
+export function listProjectProfiles() {
+  return db.prepare(`
+    SELECT *
+    FROM project_profiles
+    ORDER BY project_name ASC, telegram_user_id ASC
+  `).all().map(hydrateProjectProfile);
+}
+
+export function listProjectConversationSummaries() {
+  return db.prepare(`
+    SELECT
+      p.telegram_user_id AS canonical_project_id,
+      p.project_name,
+      l.chat_id,
+      COALESCE(l.chat_title, MAX(c.chat_title)) AS chat_title,
+      COUNT(c.id) AS message_count,
+      MAX(CASE WHEN c.sender_role = 'project' THEN c.message_date_iso END) AS last_project_message_at,
+      MAX(CASE WHEN c.sender_role = 'team' THEN c.message_date_iso END) AS last_team_message_at
+    FROM project_profiles p
+    LEFT JOIN project_chat_links l
+      ON l.canonical_project_id = p.telegram_user_id
+     AND l.active = 1
+    LEFT JOIN conversations c
+      ON c.chat_id = l.chat_id
+    GROUP BY p.telegram_user_id, p.project_name, l.chat_id, l.chat_title
+    HAVING l.chat_id IS NOT NULL
+    ORDER BY p.project_name ASC, l.chat_id ASC
+  `).all();
+}
+
+export function listProjectOpportunityRows(limit = 500) {
+  return db.prepare(`
+    SELECT
+      k.related_project_tg_id AS canonical_project_id,
+      p.project_name,
+      k.scope,
+      k.title,
+      k.content,
+      k.created_at
+    FROM knowledge_items k
+    LEFT JOIN project_profiles p
+      ON p.telegram_user_id = k.related_project_tg_id
+    WHERE k.active = 1
+      AND k.scope IN ('partner_opportunity', 'project_need', 'buying_signal', 'service_angle', 'followup_strategy')
+    ORDER BY k.created_at DESC, k.id DESC
+    LIMIT ?
+  `).all(limit);
+}
+
 function hydrateProjectProfile(row) {
   return {
     ...row,
@@ -1510,6 +1745,14 @@ function hydrateProjectProfile(row) {
     targets: jsonParse(row.targets_json, []),
     rawFields: jsonParse(row.raw_fields_json, {}),
     embedding: jsonParse(row.embedding_json, []),
+  };
+}
+
+function hydrateSourceSnapshot(row) {
+  return {
+    ...row,
+    contentJson: jsonParse(row.content_json, null),
+    metadata: jsonParse(row.metadata_json, null),
   };
 }
 

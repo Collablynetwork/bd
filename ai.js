@@ -1,5 +1,5 @@
 import { BOT_NAME, OPENAI_CHAT_MODEL, openaiClient } from './config.js';
-import { compactText } from './utils.js';
+import { compactText, nowIso } from './utils.js';
 
 const BASE_SYSTEM_PROMPT = [
   `You are ${BOT_NAME}'s paid Business Development Manager.`,
@@ -24,6 +24,7 @@ export async function generateBDSuggestion({
   projectConversationMemory,
   knowledge,
   approvedExamples,
+  generalReplyPatterns,
   operatorInstructions,
 }) {
   const userPrompt = [
@@ -47,10 +48,10 @@ export async function generateBDSuggestion({
       ? history.map((entry) => `${entry.sender_role === 'team' ? 'Collably' : 'Project'}: ${entry.message_text}`).join('\n')
       : 'No prior history.',
     '',
-    'Project-wide earlier conversation history from stored chats:',
+    'Earlier conversation history from this same Telegram group:',
     projectConversationMemory.length
       ? projectConversationMemory.map((entry) => `${entry.sender_role === 'team' ? 'Collably' : 'Project'} [${entry.chat_title}]: ${entry.message_text}`).join('\n')
-      : 'No broader stored project conversation found yet.',
+      : 'No earlier same-group conversation found yet.',
     '',
     'Project-specific memory from earlier discussions:',
     projectMemory.length
@@ -69,11 +70,20 @@ export async function generateBDSuggestion({
       )).join('\n\n')
       : 'No approved reply examples.',
     '',
+    'General similar reply patterns from other Collably discussions:',
+    generalReplyPatterns.length
+      ? generalReplyPatterns.map((entry, index) => (
+        `${index + 1}. Client: ${entry.client_text}\nCollably: ${entry.actual_reply_text}`
+      )).join('\n\n')
+      : 'No broader repeated-discussion pattern found.',
+    '',
     'Latest project message:',
     clientMessage,
     '',
-    'Use the broader stored project conversation to infer requirements, prior objections, and prior asks when relevant.',
+    'Use only this group history plus the current project profile to infer requirements, prior objections, and prior asks.',
     'Do not ask the project to repeat information they already provided in earlier conversations unless the context is clearly outdated or conflicting.',
+    'You may reuse wording patterns from other approved Collably replies only when the question pattern is similar.',
+    'Do not carry over project-specific facts, names, pricing, dates, or promises from another group unless the current project context independently supports them.',
     'Return JSON with keys: reply, reason, serviceAngle, confidence.',
     'reply must be ready to send as-is and must stay short.',
     'reason and serviceAngle should each be a short internal phrase.',
@@ -235,6 +245,7 @@ export async function generateTeamResearchAnswer({
   conversationSnippets,
   relevantKnowledge,
   approvedExamples,
+  generalReplyPatterns = [],
 }) {
   const prompt = [
     `You are ${BOT_NAME}'s internal BD support assistant for the Collably team.`,
@@ -279,6 +290,13 @@ export async function generateTeamResearchAnswer({
     approvedExamples.length
       ? approvedExamples.map((entry, index) => `${index + 1}. Client: ${entry.client_text}\nCollably: ${entry.actual_reply_text}`).join('\n\n')
       : 'No approved reply examples.',
+    '',
+    'General similar reply patterns across other project discussions:',
+    generalReplyPatterns.length
+      ? generalReplyPatterns.map((entry, index) => `${index + 1}. Client: ${entry.client_text}\nCollably: ${entry.actual_reply_text}`).join('\n\n')
+      : 'No broader repeated-discussion pattern found.',
+    '',
+    'Use broader patterns only as style/reference. Do not reuse project-specific facts from another project unless they are also present in the matched profile or current project context.',
   ].join('\n');
 
   const result = await callJsonModel([
@@ -295,6 +313,44 @@ export async function generateTeamResearchAnswer({
     answer: compactText(String(result.answer || 'No strong match found in the stored project memory yet.')),
     replyOptions: normalizeStringArray(result.replyOptions).slice(0, 3).map((item) => trimReplyLength(item, 60)),
     matchedProjects: normalizeStringArray(result.matchedProjects).slice(0, 3),
+    confidence: cleanSentence(result.confidence, 'low'),
+  };
+}
+
+export async function extractAnnouncementReminderCandidate({
+  messageText,
+  projectProfile,
+}) {
+  const prompt = [
+    `You extract announcement or timeline reminders for ${BOT_NAME}.`,
+    'Only return a reminder when the message clearly contains a future announcement, launch, AMA, listing, event, or important timeline with a date and time.',
+    'Return JSON with keys: shouldCreateReminder, localDateTime, reminderText, confidence.',
+    'localDateTime must be in YYYY-MM-DD HH:mm format in the operator local timezone.',
+    'If the message does not clearly contain a usable future date and time, return shouldCreateReminder false and empty strings.',
+    '',
+    `Current timestamp: ${nowIso()}`,
+    '',
+    'Project profile:',
+    projectProfile?.overview || 'No profile found.',
+    '',
+    'Message:',
+    messageText,
+  ].join('\n');
+
+  const result = await callJsonModel([
+    { role: 'system', content: BASE_SYSTEM_PROMPT },
+    { role: 'user', content: prompt },
+  ], {
+    shouldCreateReminder: false,
+    localDateTime: '',
+    reminderText: '',
+    confidence: 'low',
+  });
+
+  return {
+    shouldCreateReminder: Boolean(result.shouldCreateReminder),
+    localDateTime: compactText(String(result.localDateTime || '')),
+    reminderText: compactText(String(result.reminderText || '')),
     confidence: cleanSentence(result.confidence, 'low'),
   };
 }

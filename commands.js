@@ -40,6 +40,7 @@ import { buildDailyKnowledge } from './scheduler.js';
 import {
   exportPendingDataToSheets,
   importServiceDatasetFromSheet,
+  syncProjectProfileForTelegramUser,
   syncProjectProfilesFromSheet,
 } from './sheets.js';
 import {
@@ -262,7 +263,7 @@ async function handleAddTeamUsage(ctx) {
     return;
   }
 
-  await ctx.reply('Usage: /addcollablyteam <telegram user id>', buildMenuMarkup());
+  await ctx.reply('Usage: /addcollablyteam <telegram user id[,more ids]>', buildMenuMarkup());
 }
 
 function buildHelpText() {
@@ -290,7 +291,7 @@ function buildHelpText() {
     '/projectstatus <project name or telegram id>',
     '/buildknowledge',
     '/trainknowledge',
-    '/addcollablyteam <telegram user id>',
+    '/addcollablyteam <telegram user id[,more ids]>',
     '/syncsheets',
     '/refreshprofiles',
     '/refreshservices',
@@ -516,22 +517,24 @@ async function handleExportHistory(ctx) {
   }
 
   const query = normalizeCommandPayload(ctx.message.text) || 'all';
-  const target = resolveHistoryExportTarget(query);
-  if (!target) {
-    await ctx.reply('Usage: /exporthistory <all|project name|telegram id|@username|chat:<id>>');
-    return;
-  }
+  await queuePrivateTask(ctx, 'export history', 'Preparing history export...', async ({ telegram, chatId }) => {
+    const target = resolveHistoryExportTarget(query);
+    if (!target) {
+      await telegram.sendMessage(chatId, 'Usage: /exporthistory <all|project name|telegram id|@username|chat:<id>>');
+      return;
+    }
 
-  const result = writeHistoryExportFiles({
-    outputDir: path.join(process.cwd(), 'exports'),
-    canonicalProjectId: target.canonicalProjectId,
-    chatId: target.chatId,
-    label: target.label,
+    const result = writeHistoryExportFiles({
+      outputDir: path.join(process.cwd(), 'exports'),
+      canonicalProjectId: target.canonicalProjectId,
+      chatId: target.chatId,
+      label: target.label,
+    });
+
+    await telegram.sendDocument(chatId, { source: result.jsonPath, filename: path.basename(result.jsonPath) });
+    await telegram.sendDocument(chatId, { source: result.csvPath, filename: path.basename(result.csvPath) });
+    await telegram.sendMessage(chatId, `History export complete.\nConversations: ${result.conversationCount}\nSuggestions: ${result.suggestionCount}`);
   });
-
-  await ctx.replyWithDocument({ source: result.jsonPath, filename: path.basename(result.jsonPath) });
-  await ctx.replyWithDocument({ source: result.csvPath, filename: path.basename(result.csvPath) });
-  await ctx.reply(`History export complete.\nConversations: ${result.conversationCount}\nSuggestions: ${result.suggestionCount}`);
 }
 
 async function handleSetLeadStage(ctx) {
@@ -737,16 +740,18 @@ async function handleExportKnowledge(ctx) {
     return;
   }
 
-  const snapshot = exportKnowledgeSnapshot();
-  const exportDir = path.join(process.cwd(), 'exports');
-  fs.mkdirSync(exportDir, { recursive: true });
+  await queuePrivateTask(ctx, 'export knowledge', 'Preparing knowledge export...', async ({ telegram, chatId }) => {
+    const snapshot = exportKnowledgeSnapshot();
+    const exportDir = path.join(process.cwd(), 'exports');
+    fs.mkdirSync(exportDir, { recursive: true });
 
-  const timestamp = nowIso().replace(/[:.]/g, '-');
-  const jsonPath = path.join(exportDir, `knowledge-export-${timestamp}.json`);
-  fs.writeFileSync(jsonPath, JSON.stringify(snapshot, null, 2));
+    const timestamp = nowIso().replace(/[:.]/g, '-');
+    const jsonPath = path.join(exportDir, `knowledge-export-${timestamp}.json`);
+    fs.writeFileSync(jsonPath, JSON.stringify(snapshot, null, 2));
 
-  await ctx.replyWithDocument({ source: jsonPath, filename: path.basename(jsonPath) });
-  await ctx.replyWithDocument({ source: getDbPath(), filename: path.basename(getDbPath()) });
+    await telegram.sendDocument(chatId, { source: jsonPath, filename: path.basename(jsonPath) });
+    await telegram.sendDocument(chatId, { source: getDbPath(), filename: path.basename(getDbPath()) });
+  });
 }
 
 async function handleFindPartners(ctx) {
@@ -755,24 +760,26 @@ async function handleFindPartners(ctx) {
   }
 
   const query = normalizeCommandPayload(ctx.message.text);
-  const targetProfile = resolveProfile(query);
-  if (!targetProfile) {
-    await ctx.reply('Project not found. Use a project name, Telegram user id, or @username.');
-    return;
-  }
+  await queuePrivateTask(ctx, 'find partners', 'Finding partner candidates...', async ({ telegram, chatId }) => {
+    const targetProfile = await resolveFreshProfile(query);
+    if (!targetProfile) {
+      await telegram.sendMessage(chatId, 'Project not found. Use a project name, Telegram user id, or @username.');
+      return;
+    }
 
-  const candidates = await findPartnerCandidates(targetProfile, 5);
-  if (!candidates.length) {
-    await ctx.reply('No strong partner candidates found in the current project database.');
-    return;
-  }
+    const candidates = await findPartnerCandidates(targetProfile, 5);
+    if (!candidates.length) {
+      await telegram.sendMessage(chatId, 'No strong partner candidates found in the current project database.');
+      return;
+    }
 
-  const recommendation = await generatePartnerRecommendations({
-    targetProfile,
-    candidates,
+    const recommendation = await generatePartnerRecommendations({
+      targetProfile,
+      candidates,
+    });
+
+    await telegram.sendMessage(chatId, recommendation);
   });
-
-  await ctx.reply(recommendation);
 }
 
 async function handleProjectStatus(ctx) {
@@ -781,23 +788,25 @@ async function handleProjectStatus(ctx) {
   }
 
   const query = normalizeCommandPayload(ctx.message.text);
-  const targetProfile = resolveProfile(query);
-  if (!targetProfile) {
-    await ctx.reply('Project not found. Use a project name, Telegram user id, or @username.');
-    return;
-  }
+  await queuePrivateTask(ctx, 'project status', 'Reviewing project status...', async ({ telegram, chatId }) => {
+    const targetProfile = await resolveFreshProfile(query);
+    if (!targetProfile) {
+      await telegram.sendMessage(chatId, 'Project not found. Use a project name, Telegram user id, or @username.');
+      return;
+    }
 
-  const recentConversation = getRecentConversationForProject({
-    projectTelegramUserId: targetProfile.telegram_user_id,
-    projectTelegramUsername: targetProfile.telegram_username,
-    limit: 12,
-  });
-  const advice = await generateProjectStatusAdvice({
-    projectProfile: targetProfile,
-    recentConversation,
-  });
+    const recentConversation = getRecentConversationForProject({
+      projectTelegramUserId: targetProfile.telegram_user_id,
+      projectTelegramUsername: targetProfile.telegram_username,
+      limit: 12,
+    });
+    const advice = await generateProjectStatusAdvice({
+      projectProfile: targetProfile,
+      recentConversation,
+    });
 
-  await ctx.reply(advice);
+    await telegram.sendMessage(chatId, advice);
+  });
 }
 
 async function handleSyncSheets(ctx) {
@@ -805,8 +814,10 @@ async function handleSyncSheets(ctx) {
     return;
   }
 
-  const result = await exportPendingDataToSheets();
-  await ctx.reply(`Sheet export complete.\nConversations: ${result.conversations}\nSuggestions: ${result.suggestions}\nKnowledge: ${result.knowledgeItems}`);
+  await queuePrivateTask(ctx, 'sync sheets', 'Exporting SQLite data to Sheets...', async ({ telegram, chatId }) => {
+    const result = await exportPendingDataToSheets();
+    await telegram.sendMessage(chatId, `Sheet export complete.\nConversations: ${result.conversations}\nSuggestions: ${result.suggestions}\nKnowledge: ${result.knowledgeItems}`);
+  });
 }
 
 async function handleRefreshProfiles(ctx) {
@@ -814,8 +825,10 @@ async function handleRefreshProfiles(ctx) {
     return;
   }
 
-  const synced = await syncProjectProfilesFromSheet();
-  await ctx.reply(`Project profiles refreshed: ${synced}`);
+  await queuePrivateTask(ctx, 'refresh profiles', 'Refreshing project profiles from the form sheet...', async ({ telegram, chatId }) => {
+    const synced = await syncProjectProfilesFromSheet();
+    await telegram.sendMessage(chatId, `Project profiles refreshed: ${synced}`);
+  });
 }
 
 async function handleRefreshServices(ctx) {
@@ -823,13 +836,15 @@ async function handleRefreshServices(ctx) {
     return;
   }
 
-  const result = await importServiceDatasetFromSheet();
-  if (!result.enabled) {
-    await ctx.reply('Service dataset import is disabled. Set SERVICE_DATASET_SHEET_ID in .env first.');
-    return;
-  }
+  await queuePrivateTask(ctx, 'refresh services', 'Refreshing service dataset cache...', async ({ telegram, chatId }) => {
+    const result = await importServiceDatasetFromSheet();
+    if (!result.enabled) {
+      await telegram.sendMessage(chatId, 'Service dataset import is disabled. Set SERVICE_DATASET_SHEET_ID in .env first.');
+      return;
+    }
 
-  await ctx.reply(`Service dataset refreshed.\nSheets processed: ${result.sheetsProcessed}\nEntries imported or updated: ${result.imported}`);
+    await telegram.sendMessage(chatId, `Service dataset refreshed.\nSheets processed: ${result.sheetsProcessed}\nEntries imported or updated: ${result.imported}`);
+  });
 }
 
 async function handleBuildKnowledge(ctx) {
@@ -837,12 +852,14 @@ async function handleBuildKnowledge(ctx) {
     return;
   }
 
-  const result = await buildDailyKnowledge({ force: true });
-  await ctx.reply([
-    'Daily knowledge build complete.',
-    `Chats processed: ${result.chatsProcessed}`,
-    `Knowledge entries updated: ${result.knowledgeItemsCreated}`,
-  ].join('\n'));
+  await queuePrivateTask(ctx, 'build knowledge', 'Building daily knowledge from conversations...', async ({ telegram, chatId }) => {
+    const result = await buildDailyKnowledge({ force: true });
+    await telegram.sendMessage(chatId, [
+      'Daily knowledge build complete.',
+      `Chats processed: ${result.chatsProcessed}`,
+      `Knowledge entries updated: ${result.knowledgeItemsCreated}`,
+    ].join('\n'));
+  });
 }
 
 async function handleAddCollablyTeam(ctx) {
@@ -851,16 +868,25 @@ async function handleAddCollablyTeam(ctx) {
   }
 
   const payload = normalizeCommandPayload(ctx.message.text);
-  const telegramUserId = Number(String(payload || '').replace(/[^\d]/g, ''));
-  if (!telegramUserId) {
-    await ctx.reply('Usage: /addcollablyteam <telegram user id>');
+  const teamIds = [...new Set(
+    String(payload || '')
+      .split(/[\s,]+/)
+      .map((value) => Number(String(value || '').replace(/[^\d]/g, '')))
+      .filter(Boolean)
+  )];
+
+  if (!teamIds.length) {
+    await ctx.reply('Usage: /addcollablyteam <telegram user id[,more ids]>');
     return;
   }
 
-  addTeamMember(telegramUserId, Number(ctx.from.id));
+  for (const telegramUserId of teamIds) {
+    addTeamMember(telegramUserId, Number(ctx.from.id));
+  }
+
   const members = getTeamMemberIds();
   await ctx.reply([
-    `Collably team member added: ${telegramUserId}`,
+    `Collably team member added: ${teamIds.join(', ')}`,
     `Active team IDs: ${members.join(', ')}`,
   ].join('\n'));
 }
@@ -1095,4 +1121,48 @@ function compactPreview(value, maxLength) {
   }
 
   return `${text.slice(0, maxLength - 3).trim()}...`;
+}
+
+async function resolveFreshProfile(query) {
+  let profile = resolveProfile(query);
+  if (!profile) {
+    try {
+      await syncProjectProfilesFromSheet();
+      profile = resolveProfile(query);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!profile) {
+    return null;
+  }
+
+  try {
+    const refreshed = await syncProjectProfileForTelegramUser({
+      telegramUserId: profile.telegram_user_id > 0 ? profile.telegram_user_id : null,
+      telegramUsername: profile.telegram_username || '',
+    });
+    return refreshed || profile;
+  } catch {
+    return profile;
+  }
+}
+
+async function queuePrivateTask(ctx, label, startText, task) {
+  const chatId = ctx.chat.id;
+  const telegram = ctx.telegram;
+
+  if (startText) {
+    await ctx.reply(startText);
+  }
+
+  setTimeout(() => {
+    Promise.resolve()
+      .then(() => task({ telegram, chatId }))
+      .catch((error) => {
+        console.error(`Background command failed (${label}):`, error);
+        telegram.sendMessage(chatId, `Task failed: ${label}\n${error.message}`).catch(() => {});
+      });
+  }, 0);
 }
