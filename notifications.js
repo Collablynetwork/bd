@@ -1,4 +1,9 @@
-import { getSuggestionDeliveries, getTeamMemberIds, recordSuggestionDelivery } from './db.js';
+import {
+  deactivateTeamMember,
+  getSuggestionDeliveries,
+  getTeamMemberIds,
+  recordSuggestionDelivery,
+} from './db.js';
 import { escapeHtml, formatLocalDateTime } from './utils.js';
 
 export async function notifyTeamAboutSuggestion(telegram, suggestion, deliveryType = 'initial', reminderNumber = 0) {
@@ -30,10 +35,14 @@ export async function notifyTeamAboutSuggestion(telegram, suggestion, deliveryTy
       });
       sentCount.push(adminId);
     } catch (error) {
-      if (error.response?.error_code === 403) {
+      if (isUnreachableChatError(error)) {
+        deactivateTeamMember(adminId);
+        console.warn(`Skipping team member ${adminId}: ${describeTelegramError(error)}`);
         continue;
       }
-      throw error;
+
+      console.warn(`Failed to send suggestion ${suggestion.id} to ${adminId}: ${describeTelegramError(error)}`);
+      continue;
     }
   }
 
@@ -70,14 +79,37 @@ export async function notifyTeamAboutAnnouncement(telegram, reminder) {
       });
       sentCount += 1;
     } catch (error) {
-      if (error.response?.error_code === 403) {
+      if (isUnreachableChatError(error)) {
+        deactivateTeamMember(adminId);
+        console.warn(`Skipping team member ${adminId}: ${describeTelegramError(error)}`);
         continue;
       }
-      throw error;
+
+      console.warn(`Failed to send announcement reminder ${reminder.id} to ${adminId}: ${describeTelegramError(error)}`);
+      continue;
     }
   }
 
   return sentCount;
+}
+
+function isUnreachableChatError(error) {
+  const code = Number(error?.response?.error_code || 0);
+  const description = String(error?.response?.description || '').toLowerCase();
+  if (code === 403) {
+    return true;
+  }
+
+  if (code === 400 && description.includes('chat not found')) {
+    return true;
+  }
+
+  return false;
+}
+
+function describeTelegramError(error) {
+  const description = error?.response?.description || error?.description || error?.message;
+  return String(description || 'unknown Telegram error');
 }
 
 function buildSuggestionHtml(suggestion, deliveryType, reminderNumber) {

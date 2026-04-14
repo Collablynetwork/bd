@@ -7,9 +7,7 @@ import { addHours, jsonParse, jsonStringify, normalizeTelegramUsername, nowIso }
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+let db = openDatabaseWithRecovery(DB_PATH);
 
 export function initDb() {
   db.exec(`
@@ -216,6 +214,54 @@ export function getDbPath() {
   return DB_PATH;
 }
 
+function openDatabaseWithRecovery(dbPath) {
+  try {
+    return openConfiguredDatabase(dbPath);
+  } catch (error) {
+    if (!isMalformedDbError(error)) {
+      throw error;
+    }
+
+    const backupPrefix = `${dbPath}.corrupt-${Date.now()}`;
+    backupCorruptDatabaseFiles(dbPath, backupPrefix);
+    console.warn(`Detected malformed SQLite database. Created backups with prefix: ${backupPrefix}`);
+    return openConfiguredDatabase(dbPath);
+  }
+}
+
+function openConfiguredDatabase(dbPath) {
+  const database = new Database(dbPath);
+  database.pragma('journal_mode = WAL');
+  database.pragma('foreign_keys = ON');
+  verifyDatabaseIntegrity(database);
+  return database;
+}
+
+function verifyDatabaseIntegrity(database) {
+  const rows = database.pragma('quick_check');
+  const firstRow = Array.isArray(rows) && rows.length ? rows[0] : null;
+  const firstValue = firstRow ? Object.values(firstRow)[0] : '';
+  if (String(firstValue || '').toLowerCase() !== 'ok') {
+    throw new Error(`SQLite integrity check failed: ${firstValue || 'unknown error'}`);
+  }
+}
+
+function backupCorruptDatabaseFiles(dbPath, backupPrefix) {
+  for (const suffix of ['', '-wal', '-shm']) {
+    const source = `${dbPath}${suffix}`;
+    if (!fs.existsSync(source)) {
+      continue;
+    }
+
+    const target = `${backupPrefix}${suffix}`;
+    fs.renameSync(source, target);
+  }
+}
+
+function isMalformedDbError(error) {
+  return String(error?.message || '').toLowerCase().includes('malformed');
+}
+
 export function addTeamMember(telegramUserId, addedBy = null) {
   db.prepare(`
     INSERT INTO team_members (
@@ -249,6 +295,17 @@ export function isTeamMember(telegramUserId) {
   `).get(telegramUserId);
 
   return Boolean(row);
+}
+
+export function deactivateTeamMember(telegramUserId) {
+  const result = db.prepare(`
+    UPDATE team_members
+    SET active = 0
+    WHERE telegram_user_id = ?
+      AND active = 1
+  `).run(telegramUserId);
+
+  return result.changes > 0;
 }
 
 export function upsertProjectAlias({
@@ -1441,6 +1498,23 @@ export function getLatestSuggestionContextForAdmin(adminId) {
     ORDER BY d.created_at DESC, d.id DESC
     LIMIT 1
   `).get(adminId) || null;
+}
+
+export function getLatestSuggestionContextForAdminByProject(adminId, projectTelegramUserId) {
+  if (!adminId || !projectTelegramUserId) {
+    return null;
+  }
+
+  return db.prepare(`
+    SELECT s.*, d.created_at AS delivery_created_at
+    FROM suggestion_deliveries d
+    JOIN suggestions s
+      ON s.id = d.suggestion_id
+    WHERE d.admin_id = ?
+      AND s.client_sender_id = ?
+    ORDER BY d.created_at DESC, d.id DESC
+    LIMIT 1
+  `).get(adminId, projectTelegramUserId) || null;
 }
 
 export function searchPartnerProfilesByEmbedding(queryEmbedding, excludeTelegramUserId, limit = 5, targetProfile = null) {
