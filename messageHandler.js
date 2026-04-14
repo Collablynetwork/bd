@@ -30,6 +30,7 @@ import {
 import { embedText } from './embed.js';
 import { notifyTeamAboutSuggestion, markSuggestionCardsHandled } from './notifications.js';
 import { findPartnerCandidates, getProjectProfileForUser, getRelevantKnowledge } from './rag.js';
+import * as sheetsApi from './sheets.js';
 import { buildChatLink, displayName, normalizeTelegramUsername, parseLocalDateTimeInput, sha256 } from './utils.js';
 import {
   extractAnnouncementReminderCandidate,
@@ -37,7 +38,6 @@ import {
   generatePartnerRecommendations,
   generateTeamResearchAnswer,
 } from './ai.js';
-import { syncProjectProfileForTelegramUser } from './sheets.js';
 
 export async function handleIncomingMessage(ctx) {
   const message = ctx.message || ctx.channelPost || ctx.update?.channel_post || ctx.update?.edited_message || ctx.update?.edited_channel_post;
@@ -741,7 +741,12 @@ async function maybeRefreshProjectProfile({
   telegramUsername,
 }) {
   try {
-    const refreshed = await syncProjectProfileForTelegramUser({
+    const syncProfile = sheetsApi.syncProjectProfileForTelegramUser;
+    if (typeof syncProfile !== 'function') {
+      return projectProfile;
+    }
+
+    const refreshed = await syncProfile({
       telegramUserId,
       telegramUsername,
       force: !projectProfile,

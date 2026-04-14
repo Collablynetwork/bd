@@ -37,10 +37,10 @@ import { generatePartnerRecommendations, generateProjectStatusAdvice } from './a
 import { writeHistoryExportFiles } from './history.js';
 import { findPartnerCandidates } from './rag.js';
 import { buildDailyKnowledge } from './scheduler.js';
+import * as sheetsApi from './sheets.js';
 import {
   exportPendingDataToSheets,
   importServiceDatasetFromSheet,
-  syncProjectProfileForTelegramUser,
   syncProjectProfilesFromSheet,
 } from './sheets.js';
 import {
@@ -1139,7 +1139,12 @@ async function resolveFreshProfile(query) {
   }
 
   try {
-    const refreshed = await syncProjectProfileForTelegramUser({
+    const syncProfile = sheetsApi.syncProjectProfileForTelegramUser;
+    if (typeof syncProfile !== 'function') {
+      return profile;
+    }
+
+    const refreshed = await syncProfile({
       telegramUserId: profile.telegram_user_id > 0 ? profile.telegram_user_id : null,
       telegramUsername: profile.telegram_username || '',
     });
