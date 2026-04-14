@@ -134,19 +134,7 @@ async function handleProjectMessage({
       senderUsername: clientUsername,
     });
   }
-  const projectConversationMemory = dedupeConversationSnippets([
-    ...searchProjectConversationSnippets({
-      projectTelegramUserId: projectProfile?.telegram_user_id || clientId,
-      projectTelegramUsername: projectProfile?.telegram_username || clientUsername,
-      query: clientText,
-      limit: 12,
-    }),
-    ...getRecentConversationForProject({
-      projectTelegramUserId: projectProfile?.telegram_user_id || clientId,
-      projectTelegramUsername: projectProfile?.telegram_username || clientUsername,
-      limit: 18,
-    }),
-  ], 18);
+  const projectConversationMemory = priorHistory.slice(-18);
   const projectMemoryProjectId = resolveProjectKnowledgeId(projectProfile, clientId);
   const projectMemory = getRecentKnowledgeForProject(
     projectMemoryProjectId,
