@@ -297,6 +297,17 @@ export function isTeamMember(telegramUserId) {
   return Boolean(row);
 }
 
+export function deactivateTeamMember(telegramUserId) {
+  const result = db.prepare(`
+    UPDATE team_members
+    SET active = 0
+    WHERE telegram_user_id = ?
+      AND active = 1
+  `).run(telegramUserId);
+
+  return result.changes > 0;
+}
+
 export function upsertProjectAlias({
   canonicalProjectId,
   aliasType,
