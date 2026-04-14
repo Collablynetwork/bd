@@ -10,6 +10,7 @@ import {
   getApplicableInstructions,
   getLatestProjectChatContext,
   getLatestSuggestionContextForAdmin,
+  getLatestSuggestionContextForAdminByProject,
   getLatestTeamChatContext,
   getPendingSuggestionByClientMessage,
   getRecentConversationForProject,
@@ -237,6 +238,7 @@ async function handleTeamPrivateQuestion({
   const focusChatContext = resolveFocusChatContext({
     primaryProfile,
     inferredContext,
+    operatorId,
   });
 
   const projectConversationSnippets = primaryProfile
@@ -662,6 +664,7 @@ function inferOperatorProjectContext(operatorId) {
     return null;
   }
 
+  const candidates = [];
   const latestTeamChat = getLatestTeamChatContext(operatorId);
   if (latestTeamChat) {
     const projectProfile = getProjectProfileForUser({
@@ -671,45 +674,65 @@ function inferOperatorProjectContext(operatorId) {
     });
 
     if (projectProfile) {
-      return {
+      candidates.push({
         projectProfile,
         chatId: latestTeamChat.chat_id,
         chatTitle: latestTeamChat.chat_title,
         source: 'latest_team_group_message',
-      };
+        contextIso: latestTeamChat.message_date_iso,
+      });
     }
   }
 
   const latestSuggestion = getLatestSuggestionContextForAdmin(operatorId);
-  if (!latestSuggestion) {
+  if (latestSuggestion) {
+    const suggestionProfile = getProjectProfileForUser({
+      telegramUserId: latestSuggestion.client_sender_id,
+      telegramUsername: '',
+      chatId: latestSuggestion.chat_id,
+    });
+
+    if (suggestionProfile) {
+      candidates.push({
+        projectProfile: suggestionProfile,
+        chatId: latestSuggestion.chat_id,
+        chatTitle: latestSuggestion.chat_title,
+        source: 'latest_delivered_suggestion',
+        contextIso: latestSuggestion.delivery_created_at || latestSuggestion.updated_at || latestSuggestion.created_at,
+      });
+    }
+  }
+
+  if (!candidates.length) {
     return null;
   }
 
-  const projectProfile = getProjectProfileForUser({
-    telegramUserId: latestSuggestion.client_sender_id,
-    telegramUsername: '',
-    chatId: latestSuggestion.chat_id,
-  });
-
-  if (!projectProfile) {
-    return null;
-  }
-
-  return {
-    projectProfile,
-    chatId: latestSuggestion.chat_id,
-    chatTitle: latestSuggestion.chat_title,
-    source: 'latest_delivered_suggestion',
-  };
+  candidates.sort((left, right) => new Date(right.contextIso || 0).getTime() - new Date(left.contextIso || 0).getTime());
+  const latest = candidates[0];
+  const { contextIso, ...context } = latest;
+  return context;
 }
 
-function resolveFocusChatContext({ primaryProfile, inferredContext }) {
+function resolveFocusChatContext({ primaryProfile, inferredContext, operatorId = null }) {
   if (!primaryProfile) {
     return null;
   }
 
   if (inferredContext?.projectProfile?.telegram_user_id === primaryProfile.telegram_user_id) {
     return inferredContext;
+  }
+
+  const latestProjectSuggestion = getLatestSuggestionContextForAdminByProject(
+    operatorId,
+    primaryProfile.telegram_user_id
+  );
+  if (latestProjectSuggestion) {
+    return {
+      projectProfile: primaryProfile,
+      chatId: latestProjectSuggestion.chat_id,
+      chatTitle: latestProjectSuggestion.chat_title,
+      source: 'latest_delivered_suggestion_for_project',
+    };
   }
 
   const latestChat = getLatestProjectChatContext({

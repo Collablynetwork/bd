@@ -1500,6 +1500,23 @@ export function getLatestSuggestionContextForAdmin(adminId) {
   `).get(adminId) || null;
 }
 
+export function getLatestSuggestionContextForAdminByProject(adminId, projectTelegramUserId) {
+  if (!adminId || !projectTelegramUserId) {
+    return null;
+  }
+
+  return db.prepare(`
+    SELECT s.*, d.created_at AS delivery_created_at
+    FROM suggestion_deliveries d
+    JOIN suggestions s
+      ON s.id = d.suggestion_id
+    WHERE d.admin_id = ?
+      AND s.client_sender_id = ?
+    ORDER BY d.created_at DESC, d.id DESC
+    LIMIT 1
+  `).get(adminId, projectTelegramUserId) || null;
+}
+
 export function searchPartnerProfilesByEmbedding(queryEmbedding, excludeTelegramUserId, limit = 5, targetProfile = null) {
   const rows = db.prepare(`
     SELECT *
