@@ -31,8 +31,9 @@ import { generateBDSuggestion, generateTeamResearchAnswer } from './ai.js';
 export async function handleIncomingMessage(ctx) {
   const message = ctx.message;
   const text = extractMessageContent(message);
+  const sender = resolveMessageSender(message);
 
-  if (!text || message.from?.is_bot) {
+  if (!text || sender.isBot) {
     return;
   }
 
@@ -40,7 +41,7 @@ export async function handleIncomingMessage(ctx) {
     return;
   }
 
-  const senderId = Number(message.from.id);
+  const senderId = sender.id;
   const senderIsTeamMember = isTeamMember(senderId);
 
   if (ctx.chat.type === 'private') {
@@ -63,8 +64,8 @@ export async function handleIncomingMessage(ctx) {
     telegramMessageId: message.message_id,
     replyToMessageId: message.reply_to_message?.message_id || null,
     senderId,
-    senderName: displayName(message.from),
-    senderUsername: message.from.username || '',
+    senderName: sender.name,
+    senderUsername: sender.username || '',
     senderRole: senderIsTeamMember ? 'team' : 'project',
     messageText: text,
     messageDateIso: new Date(message.date * 1000).toISOString(),
@@ -73,7 +74,7 @@ export async function handleIncomingMessage(ctx) {
   if (senderIsTeamMember) {
     queueBackgroundTask('announcement candidate', () => maybeCaptureAnnouncementCandidate({
       senderId,
-      senderUsername: ctx.message.from.username || '',
+      senderUsername: sender.username || '',
       chatId: ctx.chat.id,
       chatTitle,
       chatLink: buildChatLink(ctx.chat, ctx.message.message_id),
@@ -81,8 +82,8 @@ export async function handleIncomingMessage(ctx) {
     }));
     queueBackgroundTask('capture actual reply', () => maybeCaptureActualReply({
       chatId: ctx.chat.id,
-      messageFromId: Number(ctx.message.from.id),
-      actorName: displayName(ctx.message.from),
+      messageFromId: senderId,
+      actorName: sender.name,
       replyToMessage: ctx.message.reply_to_message,
       actualReplyText: text,
       telegram: ctx.telegram,
@@ -92,9 +93,9 @@ export async function handleIncomingMessage(ctx) {
 
   queueBackgroundTask('project message', () => handleProjectMessage({
     telegram: ctx.telegram,
-    clientId: Number(ctx.message.from.id),
-    clientUsername: ctx.message.from.username || '',
-    clientName: displayName(ctx.message.from),
+    clientId: senderId,
+    clientUsername: sender.username || '',
+    clientName: sender.name,
     chatId: ctx.chat.id,
     chatTitle,
     chatLink: buildChatLink(ctx.chat, ctx.message.message_id),
@@ -133,19 +134,7 @@ async function handleProjectMessage({
       senderUsername: clientUsername,
     });
   }
-  const projectConversationMemory = dedupeConversationSnippets([
-    ...searchProjectConversationSnippets({
-      projectTelegramUserId: projectProfile?.telegram_user_id || clientId,
-      projectTelegramUsername: projectProfile?.telegram_username || clientUsername,
-      query: clientText,
-      limit: 12,
-    }),
-    ...getRecentConversationForProject({
-      projectTelegramUserId: projectProfile?.telegram_user_id || clientId,
-      projectTelegramUsername: projectProfile?.telegram_username || clientUsername,
-      limit: 18,
-    }),
-  ], 18);
+  const projectConversationMemory = priorHistory.slice(-18);
   const projectMemoryProjectId = resolveProjectKnowledgeId(projectProfile, clientId);
   const projectMemory = getRecentKnowledgeForProject(
     projectMemoryProjectId,
@@ -469,6 +458,33 @@ function extractMessageContent(message) {
   const text = String(message?.text || message?.caption || '').trim();
   const attachmentSummary = buildAttachmentSummary(message);
   return [text, attachmentSummary].filter(Boolean).join('\n').trim();
+}
+
+function resolveMessageSender(message) {
+  if (message?.from) {
+    return {
+      id: Number(message.from.id),
+      username: message.from.username || '',
+      name: displayName(message.from),
+      isBot: Boolean(message.from.is_bot),
+    };
+  }
+
+  if (message?.sender_chat) {
+    return {
+      id: Number(message.sender_chat.id),
+      username: message.sender_chat.username || '',
+      name: message.sender_chat.title || message.sender_chat.username || `Chat_${message.sender_chat.id}`,
+      isBot: false,
+    };
+  }
+
+  return {
+    id: 0,
+    username: '',
+    name: 'Unknown sender',
+    isBot: false,
+  };
 }
 
 function buildAttachmentSummary(message) {
