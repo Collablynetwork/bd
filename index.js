@@ -2,12 +2,14 @@ import bot from './bot.js';
 import { setupTelegramCommands } from './commands.js';
 import { initDb } from './db.js';
 import { runStartupTasks, startSchedulers } from './scheduler.js';
+import { hydratePartnerSchedules } from './partnerFlow.js';
 
 let isBotRunning = false;
 
 async function main() {
   initDb();
   await bot.telegram.getMe();
+  await hydratePartnerSchedules(bot);
 
   const launchPromise = bot.launch({
     polling: { drop_pending_updates: true },

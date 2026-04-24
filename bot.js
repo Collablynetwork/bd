@@ -5,14 +5,19 @@ import { registerCommands } from './commands.js';
 import { handleIncomingMessage } from './messageHandler.js';
 import { markSuggestionCardsHandled } from './notifications.js';
 import { displayName } from './utils.js';
+import { handlePartnerCallback, registerPartnerFlow } from './partnerFlow.js';
 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
 registerCommands(bot);
+registerPartnerFlow(bot);
 
 bot.on('message', handleIncomingMessage);
 
 bot.on('callback_query', async (ctx) => {
+  const partnerHandled = await handlePartnerCallback(ctx);
+  if (partnerHandled) return;
+
   const data = ctx.callbackQuery?.data || '';
   if (data === 'noop') {
     await ctx.answerCbQuery('Already handled.');
