@@ -35,6 +35,7 @@ import {
   linkProjectChat,
   listProjectConversationSummaries,
   listBroadcastTargetChats,
+  recordBotChat,
 } from './db.js';
 import { embedText } from './embed.js';
 import { generatePartnerRecommendations, generateProjectStatusAdvice } from './ai.js';
@@ -89,6 +90,7 @@ const BOT_COMMANDS = [
   { command: 'refreshservices', description: 'Reload the Collably service dataset from Sheets' },
   { command: 'hidemenu', description: 'Hide the private menu keyboard' },
   { command: 'broadcast', description: 'Admin: broadcast a message to all known groups' },
+  { command: 'importgroups', description: 'Admin: import group chat IDs for broadcast' },
   { command: 'deletebroadcast', description: 'Admin: delete last/all broadcast messages' },
 ];
 
@@ -112,6 +114,7 @@ const MENU_LABELS = {
 
 export const RESERVED_PRIVATE_TEXTS = new Set(Object.values(MENU_LABELS));
 const BROADCAST_HISTORY_FILE = path.join(process.cwd(), 'data', 'broadcast-history.json');
+const pendingGroupImports = new Map();
 
 function readBroadcastHistory() {
   try {
@@ -182,6 +185,7 @@ export function registerCommands(bot) {
   bot.command('addcollablyteam', handleAddCollablyTeam);
   bot.command('hidemenu', handleHideMenu);
   bot.command('broadcast', handleBroadcast);
+  bot.command('importgroups', handleImportGroups);
   bot.command('deletebroadcast', handleDeleteBroadcast);
   bot.command('deletebroadcasts', handleDeleteBroadcast);
 
@@ -200,7 +204,9 @@ export function registerCommands(bot) {
   bot.hears(MENU_LABELS.projectStatus, handleProjectStatusUsage);
   bot.hears(MENU_LABELS.addTeam, handleAddTeamUsage);
   bot.hears(MENU_LABELS.hideMenu, handleHideMenu);
+  bot.on('text', handlePendingGroupImportText);
 }
+
 
 export async function setupTelegramCommands(bot) {
   try {
@@ -343,6 +349,9 @@ function buildHelpText() {
     '/syncsheets',
     '/refreshprofiles',
     '/refreshservices',
+    '/broadcast <message>',
+    '/importgroups',
+    '/deletebroadcast last|all',
     '/hidemenu',
   ].join('\n');
 }
@@ -939,6 +948,103 @@ async function handleAddCollablyTeam(ctx) {
   ].join('\n'));
 }
 
+
+function parseGroupImportLines(text = '') {
+  return String(text)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      // Only chat IDs are required. Example line: -1001111111111
+      const match = line.match(/^(-?\d{6,20})$/);
+      if (!match) return null;
+      const chatId = Number(match[1]);
+      if (!Number.isFinite(chatId)) return null;
+      return { chatId, title: `Imported ${chatId}` };
+    })
+    .filter(Boolean);
+}
+
+async function importGroupChatsFromText(ctx, text) {
+  const groups = parseGroupImportLines(text);
+  if (!groups.length) {
+    await ctx.reply([
+      'No valid group chat IDs found.',
+      'Send only one group chat ID per line like:',
+      '-1001111111111',
+      '-1002222222222',
+    ].join('\n'));
+    return;
+  }
+
+  let imported = 0;
+  const seen = new Set();
+  for (const group of groups) {
+    if (seen.has(group.chatId)) continue;
+    seen.add(group.chatId);
+    recordBotChat({
+      id: group.chatId,
+      type: 'supergroup',
+      title: group.title,
+    });
+    imported += 1;
+  }
+
+  await ctx.reply([
+    `✅ Imported ${imported} group chat ID(s).`,
+    'Broadcast will now use both:',
+    '• Groups auto-saved when the bot receives an update/message',
+    '• Groups manually imported with /importgroups',
+    '',
+    'Note: the bot must still be added to each group and allowed to send messages.',
+  ].join('\n'));
+}
+
+async function handleImportGroups(ctx) {
+  if (!ensureAdminPrivate(ctx)) return;
+
+  const payload = normalizeCommandPayload(ctx.message?.text || '', '/importgroups').trim();
+  if (payload) {
+    await importGroupChatsFromText(ctx, payload);
+    return;
+  }
+
+  pendingGroupImports.set(Number(ctx.from.id), Date.now());
+  await ctx.reply([
+    'Send group chat IDs now, one per line:',
+    '',
+    '-1001111111111',
+    '-1002222222222',
+    '',
+    'You can also use directly:',
+    '/importgroups -1001111111111',
+  ].join('\n'));
+}
+
+async function handlePendingGroupImportText(ctx, next) {
+  const userId = Number(ctx.from?.id || 0);
+  const text = ctx.message?.text || '';
+
+  if (!pendingGroupImports.has(userId)) {
+    if (typeof next === 'function') return next();
+    return;
+  }
+
+  if (!ensureAdminPrivate(ctx)) {
+    pendingGroupImports.delete(userId);
+    return;
+  }
+
+  if (text.startsWith('/')) {
+    pendingGroupImports.delete(userId);
+    if (typeof next === 'function') return next();
+    return;
+  }
+
+  pendingGroupImports.delete(userId);
+  await importGroupChatsFromText(ctx, text);
+}
+
 async function handleBroadcast(ctx) {
   if (!ensureAdminPrivate(ctx)) return;
 
@@ -957,8 +1063,7 @@ async function handleBroadcast(ctx) {
   if (!chatIds.length) {
     await ctx.reply([
       'No group chats found for broadcast yet.',
-      'The bot can broadcast only to groups where it has received at least one update/message after this version is running.',
-      'Send any message or command in each group once, then try /broadcast again.'
+      'Use /importgroups to manually add group chat IDs, or send any message/command once in each group so the bot can auto-save it.'
     ].join('\n'));
     return;
   }
