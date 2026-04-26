@@ -79,9 +79,10 @@ function ensurePartnerEnv() {
 
 function ensureChatState(chatId) {
   const key = String(chatId);
-  if (!store.chats[key]) store.chats[key] = { shown: [], weeklyEnabled: true };
+  if (!store.chats[key]) store.chats[key] = { shown: [], weeklyEnabled: true, projectSendingEnabled: true };
   if (!Array.isArray(store.chats[key].shown)) store.chats[key].shown = [];
   if (typeof store.chats[key].weeklyEnabled !== 'boolean') store.chats[key].weeklyEnabled = true;
+  if (typeof store.chats[key].projectSendingEnabled !== 'boolean') store.chats[key].projectSendingEnabled = true;
   return store.chats[key];
 }
 
@@ -168,6 +169,9 @@ Would you like to proceed with a partnership with the project?
 
 async function sendRandomPartner(bot, chatId) {
   try {
+    const state = ensureChatState(chatId);
+    if (!state.projectSendingEnabled) return;
+
     const trackingData = await fetchPartnerSheetData('Partnership Tracking Projects');
     if (!trackingData.length) {
       await sendNoMoreMatches(bot, chatId);
@@ -200,7 +204,6 @@ async function sendRandomPartner(bot, chatId) {
       return;
     }
 
-    const state = ensureChatState(chatId);
     const shownSet = new Set((state.shown || []).map(String));
     const fresh = candidates.filter((candidate) => {
       const notSeenByThisChat = !shownSet.has(String(candidate.groupId));
@@ -223,10 +226,20 @@ async function sendRandomPartner(bot, chatId) {
 }
 
 async function startDailyFlow(bot, chatId) {
+  const state = ensureChatState(chatId);
+  state.projectSendingEnabled = true;
+  await saveStore();
   await sendRandomPartner(bot, chatId);
   const intervalId = setInterval(() => sendRandomPartner(bot, chatId), DAILY_MS);
   if (!Array.isArray(intervalMap[chatId])) intervalMap[chatId] = [];
   intervalMap[chatId].push(intervalId);
+}
+
+async function stopProjectSendingForChat(chatId) {
+  const state = ensureChatState(chatId);
+  state.projectSendingEnabled = false;
+  await saveStore();
+  stopAllForChat(chatId);
 }
 
 function stopAllForChat(chatId) {
@@ -300,6 +313,16 @@ export function registerPartnerFlow(bot) {
   bot.command('stop', async (ctx) => {
     const stopped = stopAllForChat(ctx.chat.id);
     if (!stopped) await ctx.reply('No active project flow found to stop.');
+  });
+
+  bot.command('stopprojects', async (ctx) => {
+    const chatId = ctx.chat.id;
+    if (!(await isAllowedPremiumOrAdmin(chatId))) {
+      await ctx.reply('This functionality works only for Premium partners of Collably Network.');
+      return;
+    }
+    await stopProjectSendingForChat(chatId);
+    await ctx.reply('✅ Project recommendations stopped for this group. Use /project to start again.');
   });
 
   bot.command('stopupdate', async (ctx) => {

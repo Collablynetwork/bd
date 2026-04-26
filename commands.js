@@ -3,6 +3,8 @@ import path from 'node:path';
 import {
   ANNOUNCEMENT_REMINDER_LEAD_MINUTES,
   BOT_NAME,
+  ADMIN_IDS,
+  BROADCAST_THROTTLE_MS,
 } from './config.js';
 import {
   addKnowledgeItem,
@@ -31,6 +33,7 @@ import {
   upsertProjectAlias,
   upsertAnnouncementReminder,
   linkProjectChat,
+  listProjectConversationSummaries,
 } from './db.js';
 import { embedText } from './embed.js';
 import { generatePartnerRecommendations, generateProjectStatusAdvice } from './ai.js';
@@ -84,6 +87,7 @@ const BOT_COMMANDS = [
   { command: 'refreshprofiles', description: 'Reload project profiles from Sheets' },
   { command: 'refreshservices', description: 'Reload the Collably service dataset from Sheets' },
   { command: 'hidemenu', description: 'Hide the private menu keyboard' },
+  { command: 'broadcast', description: 'Admin: broadcast a message to project groups' },
 ];
 
 const MENU_LABELS = {
@@ -136,6 +140,7 @@ export function registerCommands(bot) {
   bot.command('trainknowledge', handleBuildKnowledge);
   bot.command('addcollablyteam', handleAddCollablyTeam);
   bot.command('hidemenu', handleHideMenu);
+  bot.command('broadcast', handleBroadcast);
 
   bot.hears(MENU_LABELS.help, handleHelp);
   bot.hears(MENU_LABELS.buildKnowledge, handleBuildKnowledge);
@@ -889,6 +894,83 @@ async function handleAddCollablyTeam(ctx) {
     `Collably team member added: ${teamIds.join(', ')}`,
     `Active team IDs: ${members.join(', ')}`,
   ].join('\n'));
+}
+
+async function handleBroadcast(ctx) {
+  if (!ensureAdminPrivate(ctx)) {
+    return;
+  }
+
+  const payload = normalizeCommandPayload(ctx.message?.text || '', '/broadcast').trim();
+  const repliedText = ctx.message?.reply_to_message?.text || ctx.message?.reply_to_message?.caption || '';
+  const message = payload || repliedText;
+
+  if (!message) {
+    await ctx.reply([
+      'Usage:',
+      '/broadcast Your message here',
+      '',
+      'Or reply to any text/caption message with /broadcast.',
+    ].join('\n'));
+    return;
+  }
+
+  const rows = listProjectConversationSummaries();
+  const chatIds = [...new Set(rows.map((row) => Number(row.chat_id)).filter(Boolean))];
+
+  if (!chatIds.length) {
+    await ctx.reply('No project/group chats found for broadcast. Link or sync project chats first.');
+    return;
+  }
+
+  await ctx.reply(`Broadcast started to ${chatIds.length} chat(s).`);
+
+  let sent = 0;
+  let failed = 0;
+  const failures = [];
+
+  for (const chatId of chatIds) {
+    try {
+      await ctx.telegram.sendMessage(chatId, message, {
+        disable_web_page_preview: false,
+      });
+      sent += 1;
+    } catch (error) {
+      failed += 1;
+      failures.push(`${chatId}: ${error.message}`);
+      console.error(`Broadcast failed for ${chatId}:`, error.message);
+    }
+
+    if (BROADCAST_THROTTLE_MS > 0) {
+      await sleep(BROADCAST_THROTTLE_MS);
+    }
+  }
+
+  await ctx.reply([
+    '✅ Broadcast completed.',
+    `Sent: ${sent}`,
+    `Failed: ${failed}`,
+    failures.length ? `Failures:\n${failures.slice(0, 10).join('\n')}` : '',
+  ].filter(Boolean).join('\n'));
+}
+
+function ensureAdminPrivate(ctx) {
+  const userId = Number(ctx.from?.id);
+  const isAdmin = ADMIN_IDS.includes(userId) || isTeamMember(userId);
+  const isPrivate = ctx.chat?.type === 'private';
+
+  if (!isAdmin || !isPrivate) {
+    if (ctx.chat?.type !== 'private') {
+      ctx.reply('Use this command in private chat with the bot.');
+    }
+    return false;
+  }
+
+  return true;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function ensureTeamPrivate(ctx) {

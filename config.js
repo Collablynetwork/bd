@@ -33,6 +33,11 @@ export const TEAM_IDS = (env.COLLABLY_TEAM_IDS || '')
   .split(',')
   .map((item) => Number(item.trim()))
   .filter(Boolean);
+export const ADMIN_IDS = (env.ADMIN_IDS || '')
+  .split(',')
+  .map((item) => Number(item.trim()))
+  .filter(Boolean);
+export const BROADCAST_THROTTLE_MS = Number(env.BROADCAST_THROTTLE_MS || 500);
 
 export const SPREADSHEET_ID = env.SPREADSHEET_ID;
 export const CLIENT_DATA_SHEET_ID = env.CLIENT_DATA_SHEET_ID;
