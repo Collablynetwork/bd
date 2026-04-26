@@ -29,6 +29,8 @@ import {
   listUpcomingAnnouncementReminders,
   removeOperatorInstruction,
   searchKnowledgeByText,
+  searchConversationSnippets,
+  searchApprovedReplyExamples,
   updateProjectLeadStage,
   upsertProjectAlias,
   upsertAnnouncementReminder,
@@ -38,7 +40,7 @@ import {
   recordBotChat,
 } from './db.js';
 import { embedText } from './embed.js';
-import { generatePartnerRecommendations, generateProjectStatusAdvice } from './ai.js';
+import { generatePartnerRecommendations, generateProjectStatusAdvice, generateTrainedReply } from './ai.js';
 import { writeHistoryExportFiles } from './history.js';
 import { findPartnerCandidates } from './rag.js';
 import { buildDailyKnowledge } from './scheduler.js';
@@ -89,6 +91,7 @@ const BOT_COMMANDS = [
   { command: 'refreshprofiles', description: 'Reload project profiles from Sheets' },
   { command: 'refreshservices', description: 'Reload the Collably service dataset from Sheets' },
   { command: 'hidemenu', description: 'Hide the private menu keyboard' },
+  { command: 'reply', description: 'Generate trained reply for a message' },
   { command: 'broadcast', description: 'Admin: broadcast a message to all known groups' },
   { command: 'importgroups', description: 'Admin: import group chat IDs for broadcast' },
   { command: 'deletebroadcast', description: 'Admin: delete last/all broadcast messages' },
@@ -184,6 +187,7 @@ export function registerCommands(bot) {
   bot.command('trainknowledge', handleBuildKnowledge);
   bot.command('addcollablyteam', handleAddCollablyTeam);
   bot.command('hidemenu', handleHideMenu);
+  bot.command('reply', handleReply);
   bot.command('broadcast', handleBroadcast);
   bot.command('importgroups', handleImportGroups);
   bot.command('deletebroadcast', handleDeleteBroadcast);
@@ -1043,6 +1047,41 @@ async function handlePendingGroupImportText(ctx, next) {
 
   pendingGroupImports.delete(userId);
   await importGroupChatsFromText(ctx, text);
+}
+
+
+async function handleReply(ctx) {
+  if (!isTeamMember(Number(ctx.from?.id))) {
+    await ctx.reply('Not allowed.');
+    return;
+  }
+
+  const payload = normalizeCommandPayload(ctx.message?.text || '', '/reply').trim();
+  const repliedText = ctx.message?.reply_to_message?.text || ctx.message?.reply_to_message?.caption || '';
+  const incomingMessage = payload || repliedText.trim();
+
+  if (!incomingMessage) {
+    await ctx.reply('Usage: /reply message\nOr reply to a message with /reply.');
+    return;
+  }
+
+  await ctx.reply('Generating trained reply...');
+
+  const result = await buildTrainedReply(incomingMessage);
+  await ctx.reply(result.reply, { disable_web_page_preview: true });
+}
+
+export async function buildTrainedReply(incomingMessage) {
+  const relevantKnowledge = searchKnowledgeByText(incomingMessage, 8);
+  const approvedExamples = searchApprovedReplyExamples(incomingMessage, { limit: 6 });
+  const conversationSnippets = searchConversationSnippets(incomingMessage, 8);
+
+  return generateTrainedReply({
+    incomingMessage,
+    relevantKnowledge,
+    approvedExamples,
+    conversationSnippets,
+  });
 }
 
 async function handleBroadcast(ctx) {
