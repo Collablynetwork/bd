@@ -43,6 +43,12 @@ export function escapeHtml(value = '') {
     .replaceAll("'", '&#39;');
 }
 
+
+export function formatMonospaceBlock(value = '') {
+  const text = escapeHtml(String(value || '').trim());
+  return `<pre>${text}</pre>`;
+}
+
 export function compactText(value = '') {
   return String(value)
     .replace(/\r/g, '')
