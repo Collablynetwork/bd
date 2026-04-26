@@ -1,6 +1,6 @@
 import { Telegraf } from 'telegraf';
 import { TELEGRAM_BOT_TOKEN } from './config.js';
-import { getSuggestionById, isTeamMember, markSuggestionHandled } from './db.js';
+import { getSuggestionById, isTeamMember, markSuggestionHandled, markBotChatInactive, recordBotChat } from './db.js';
 import { registerCommands } from './commands.js';
 import { handleIncomingMessage } from './messageHandler.js';
 import { markSuggestionCardsHandled } from './notifications.js';
@@ -11,6 +11,23 @@ const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
 registerCommands(bot);
 registerPartnerFlow(bot);
+
+bot.use(async (ctx, next) => {
+  try {
+    if (ctx.chat) {
+      recordBotChat(ctx.chat);
+    }
+
+    const status = ctx.myChatMember?.new_chat_member?.status;
+    if (ctx.myChatMember?.chat && ['left', 'kicked'].includes(status)) {
+      markBotChatInactive(ctx.myChatMember.chat.id);
+    }
+  } catch (error) {
+    console.error('Failed to record bot chat:', error.message);
+  }
+
+  return next();
+});
 
 bot.on('message', handleIncomingMessage);
 

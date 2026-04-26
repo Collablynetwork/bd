@@ -34,6 +34,7 @@ import {
   upsertAnnouncementReminder,
   linkProjectChat,
   listProjectConversationSummaries,
+  listBroadcastTargetChats,
 } from './db.js';
 import { embedText } from './embed.js';
 import { generatePartnerRecommendations, generateProjectStatusAdvice } from './ai.js';
@@ -87,7 +88,7 @@ const BOT_COMMANDS = [
   { command: 'refreshprofiles', description: 'Reload project profiles from Sheets' },
   { command: 'refreshservices', description: 'Reload the Collably service dataset from Sheets' },
   { command: 'hidemenu', description: 'Hide the private menu keyboard' },
-  { command: 'broadcast', description: 'Admin: broadcast a message to project groups' },
+  { command: 'broadcast', description: 'Admin: broadcast a message to all known groups' },
   { command: 'deletebroadcast', description: 'Admin: delete last/all broadcast messages' },
 ];
 
@@ -950,15 +951,19 @@ async function handleBroadcast(ctx) {
     return;
   }
 
-  const rows = listProjectConversationSummaries();
+  const rows = listBroadcastTargetChats({ includePrivate: false });
   const chatIds = [...new Set(rows.map((row) => Number(row.chat_id)).filter(Boolean))];
 
   if (!chatIds.length) {
-    await ctx.reply('No project/group chats found for broadcast. Link or sync project chats first.');
+    await ctx.reply([
+      'No group chats found for broadcast yet.',
+      'The bot can broadcast only to groups where it has received at least one update/message after this version is running.',
+      'Send any message or command in each group once, then try /broadcast again.'
+    ].join('\n'));
     return;
   }
 
-  await ctx.reply(`Broadcast started to ${chatIds.length} chat(s).`);
+  await ctx.reply(`Broadcast started to ${chatIds.length} group chat(s).`);
 
   const broadcastId = `${Date.now()}_${ctx.from.id}`;
   const sentRecords = [];

@@ -188,6 +188,18 @@ export function initDb() {
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     );
 
+
+
+    CREATE TABLE IF NOT EXISTS bot_chats (
+      chat_id INTEGER PRIMARY KEY,
+      chat_type TEXT NOT NULL,
+      chat_title TEXT,
+      chat_username TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_conversations_chat_id ON conversations(chat_id, message_date_iso);
     CREATE INDEX IF NOT EXISTS idx_conversations_sender_id ON conversations(sender_id, message_date_iso);
     CREATE INDEX IF NOT EXISTS idx_suggestions_due ON suggestions(status, next_reminder_at);
@@ -198,6 +210,7 @@ export function initDb() {
     CREATE INDEX IF NOT EXISTS idx_project_chat_links_lookup ON project_chat_links(chat_id, active);
     CREATE INDEX IF NOT EXISTS idx_suggestion_reviews_lookup ON suggestion_reviews(suggestion_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_source_snapshots_type ON source_snapshots(source_type, refreshed_at);
+    CREATE INDEX IF NOT EXISTS idx_bot_chats_broadcast ON bot_chats(active, chat_type, last_seen_at);
   `);
 
   ensureColumn('project_profiles', 'telegram_username', 'TEXT');
@@ -1791,6 +1804,56 @@ export function listProjectConversationSummaries() {
     HAVING l.chat_id IS NOT NULL
     ORDER BY p.project_name ASC, l.chat_id ASC
   `).all();
+}
+
+
+export function recordBotChat(chat) {
+  if (!chat?.id) return;
+
+  const chatId = Number(chat.id);
+  const chatType = chat.type || 'unknown';
+  const chatTitle = chat.title || chat.first_name || chat.username || '';
+  const chatUsername = chat.username ? normalizeTelegramUsername(chat.username) : null;
+
+  db.prepare(`
+    INSERT INTO bot_chats (chat_id, chat_type, chat_title, chat_username, active, first_seen_at, last_seen_at)
+    VALUES (@chatId, @chatType, @chatTitle, @chatUsername, 1, @now, @now)
+    ON CONFLICT(chat_id) DO UPDATE SET
+      chat_type = excluded.chat_type,
+      chat_title = excluded.chat_title,
+      chat_username = excluded.chat_username,
+      active = 1,
+      last_seen_at = excluded.last_seen_at
+  `).run({
+    chatId,
+    chatType,
+    chatTitle,
+    chatUsername,
+    now: nowIso(),
+  });
+}
+
+export function markBotChatInactive(chatId) {
+  if (!chatId) return;
+  db.prepare(`
+    UPDATE bot_chats
+    SET active = 0, last_seen_at = @now
+    WHERE chat_id = @chatId
+  `).run({ chatId: Number(chatId), now: nowIso() });
+}
+
+export function listBroadcastTargetChats({ includePrivate = false } = {}) {
+  const types = includePrivate
+    ? ['private', 'group', 'supergroup']
+    : ['group', 'supergroup'];
+
+  return db.prepare(`
+    SELECT chat_id, chat_type, chat_title, chat_username, last_seen_at
+    FROM bot_chats
+    WHERE active = 1
+      AND chat_type IN (${types.map(() => '?').join(', ')})
+    ORDER BY last_seen_at DESC, chat_title ASC
+  `).all(...types);
 }
 
 export function listProjectOpportunityRows(limit = 500) {
