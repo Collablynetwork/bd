@@ -54,6 +54,7 @@ import {
   buildChatLinkFromParts,
   extractTags,
   formatLocalDateTime,
+  formatMonospaceBlock,
   extractNumericTelegramId,
   isNumeric,
   normalizeTelegramUsername,
@@ -1068,7 +1069,7 @@ async function handleReply(ctx) {
   await ctx.reply('Generating trained reply...');
 
   const result = await buildTrainedReply(incomingMessage);
-  await ctx.reply(result.reply, { disable_web_page_preview: true });
+  await ctx.reply(formatMonospaceBlock(result.reply), { parse_mode: 'HTML', disable_web_page_preview: true });
 }
 
 export async function buildTrainedReply(incomingMessage) {
