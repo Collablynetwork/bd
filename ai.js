@@ -317,6 +317,54 @@ export async function generateTeamResearchAnswer({
   };
 }
 
+
+export async function generateTrainedReply({
+  incomingMessage,
+  relevantKnowledge = [],
+  approvedExamples = [],
+  conversationSnippets = [],
+}) {
+  const prompt = [
+    `You are ${BOT_NAME}'s trained reply assistant.`,
+    'Write one Telegram-ready reply using only the provided Collably knowledge, trained examples, and conversation snippets.',
+    'Keep it concise, professional, and useful for business development.',
+    'Do not invent commitments, partnerships, prices, dates, or private facts that are not present in the context.',
+    'Ask one clear question only if the message lacks enough context.',
+    'Return JSON with keys: reply, confidence.',
+    '',
+    'Relevant knowledge:',
+    relevantKnowledge.length
+      ? relevantKnowledge.map((entry, index) => `${index + 1}. [${entry.scope || 'knowledge'}] ${entry.content}`).join('\n')
+      : 'No matching knowledge found.',
+    '',
+    'Approved reply examples:',
+    approvedExamples.length
+      ? approvedExamples.map((entry, index) => `${index + 1}. Client: ${entry.client_text}\nCollably: ${entry.actual_reply_text}`).join('\n\n')
+      : 'No approved examples found.',
+    '',
+    'Relevant conversation snippets:',
+    conversationSnippets.length
+      ? conversationSnippets.map((entry, index) => `${index + 1}. [${entry.chat_title || 'chat'}] ${entry.sender_role === 'team' ? 'Collably' : 'Project'}: ${entry.message_text}`).join('\n')
+      : 'No relevant conversation snippets found.',
+    '',
+    'Incoming message to reply to:',
+    incomingMessage,
+  ].join('\n');
+
+  const result = await callJsonModel([
+    { role: 'system', content: BASE_SYSTEM_PROMPT },
+    { role: 'user', content: prompt },
+  ], {
+    reply: 'Thanks for sharing. Can you please confirm your main requirement so we can suggest the most relevant next step?',
+    confidence: 'low',
+  });
+
+  return {
+    reply: trimReplyLength(result.reply, 80),
+    confidence: cleanSentence(result.confidence, 'low'),
+  };
+}
+
 export async function extractAnnouncementReminderCandidate({
   messageText,
   projectProfile,
