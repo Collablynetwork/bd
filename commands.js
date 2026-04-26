@@ -88,6 +88,7 @@ const BOT_COMMANDS = [
   { command: 'refreshservices', description: 'Reload the Collably service dataset from Sheets' },
   { command: 'hidemenu', description: 'Hide the private menu keyboard' },
   { command: 'broadcast', description: 'Admin: broadcast a message to project groups' },
+  { command: 'deletebroadcast', description: 'Admin: delete last/all broadcast messages' },
 ];
 
 const MENU_LABELS = {
@@ -109,6 +110,45 @@ const MENU_LABELS = {
 };
 
 export const RESERVED_PRIVATE_TEXTS = new Set(Object.values(MENU_LABELS));
+const BROADCAST_HISTORY_FILE = path.join(process.cwd(), 'data', 'broadcast-history.json');
+
+function readBroadcastHistory() {
+  try {
+    if (!fs.existsSync(BROADCAST_HISTORY_FILE)) return { broadcasts: [] };
+    const parsed = JSON.parse(fs.readFileSync(BROADCAST_HISTORY_FILE, 'utf8'));
+    return Array.isArray(parsed.broadcasts) ? parsed : { broadcasts: [] };
+  } catch (error) {
+    console.error('Failed to read broadcast history:', error.message);
+    return { broadcasts: [] };
+  }
+}
+
+function writeBroadcastHistory(history) {
+  try {
+    fs.mkdirSync(path.dirname(BROADCAST_HISTORY_FILE), { recursive: true });
+    fs.writeFileSync(BROADCAST_HISTORY_FILE, JSON.stringify(history, null, 2));
+  } catch (error) {
+    console.error('Failed to write broadcast history:', error.message);
+  }
+}
+
+function saveBroadcastRecord(record) {
+  const history = readBroadcastHistory();
+  history.broadcasts.push(record);
+  writeBroadcastHistory(history);
+}
+
+function updateBroadcastHistoryAfterDelete(deleteMode, deletedBroadcastIds = []) {
+  const history = readBroadcastHistory();
+  if (deleteMode === 'all') {
+    history.broadcasts = [];
+  } else {
+    const ids = new Set(deletedBroadcastIds);
+    history.broadcasts = history.broadcasts.filter((item) => !ids.has(item.broadcastId));
+  }
+  writeBroadcastHistory(history);
+}
+
 
 export function registerCommands(bot) {
   bot.command('menu', handleMenu);
@@ -141,6 +181,8 @@ export function registerCommands(bot) {
   bot.command('addcollablyteam', handleAddCollablyTeam);
   bot.command('hidemenu', handleHideMenu);
   bot.command('broadcast', handleBroadcast);
+  bot.command('deletebroadcast', handleDeleteBroadcast);
+  bot.command('deletebroadcasts', handleDeleteBroadcast);
 
   bot.hears(MENU_LABELS.help, handleHelp);
   bot.hears(MENU_LABELS.buildKnowledge, handleBuildKnowledge);
@@ -897,21 +939,14 @@ async function handleAddCollablyTeam(ctx) {
 }
 
 async function handleBroadcast(ctx) {
-  if (!ensureAdminPrivate(ctx)) {
-    return;
-  }
+  if (!ensureAdminPrivate(ctx)) return;
 
   const payload = normalizeCommandPayload(ctx.message?.text || '', '/broadcast').trim();
   const repliedText = ctx.message?.reply_to_message?.text || ctx.message?.reply_to_message?.caption || '';
   const message = payload || repliedText;
 
   if (!message) {
-    await ctx.reply([
-      'Usage:',
-      '/broadcast Your message here',
-      '',
-      'Or reply to any text/caption message with /broadcast.',
-    ].join('\n'));
+    await ctx.reply(['Usage:', '/broadcast Your message here', '', 'Or reply to any text/caption message with /broadcast.'].join('\n'));
     return;
   }
 
@@ -925,15 +960,16 @@ async function handleBroadcast(ctx) {
 
   await ctx.reply(`Broadcast started to ${chatIds.length} chat(s).`);
 
+  const broadcastId = `${Date.now()}_${ctx.from.id}`;
+  const sentRecords = [];
   let sent = 0;
   let failed = 0;
   const failures = [];
 
   for (const chatId of chatIds) {
     try {
-      await ctx.telegram.sendMessage(chatId, message, {
-        disable_web_page_preview: false,
-      });
+      const sentMessage = await ctx.telegram.sendMessage(chatId, message, { disable_web_page_preview: false });
+      sentRecords.push({ chatId, messageId: sentMessage.message_id });
       sent += 1;
     } catch (error) {
       failed += 1;
@@ -941,19 +977,79 @@ async function handleBroadcast(ctx) {
       console.error(`Broadcast failed for ${chatId}:`, error.message);
     }
 
-    if (BROADCAST_THROTTLE_MS > 0) {
-      await sleep(BROADCAST_THROTTLE_MS);
-    }
+    if (BROADCAST_THROTTLE_MS > 0) await sleep(BROADCAST_THROTTLE_MS);
+  }
+
+  if (sentRecords.length) {
+    saveBroadcastRecord({
+      broadcastId,
+      createdAt: nowIso(),
+      createdBy: Number(ctx.from.id),
+      textPreview: message.slice(0, 120),
+      messages: sentRecords,
+    });
   }
 
   await ctx.reply([
     '✅ Broadcast completed.',
+    `Broadcast ID: ${broadcastId}`,
     `Sent: ${sent}`,
     `Failed: ${failed}`,
     failures.length ? `Failures:\n${failures.slice(0, 10).join('\n')}` : '',
   ].filter(Boolean).join('\n'));
 }
 
+async function handleDeleteBroadcast(ctx) {
+  if (!ensureAdminPrivate(ctx)) return;
+
+  const rawPayload = normalizeCommandPayload(ctx.message?.text || '', '/deletebroadcast').trim();
+  const mode = rawPayload.toLowerCase() || 'last';
+
+  if (!['last', 'all'].includes(mode)) {
+    await ctx.reply(['Usage:', '/deletebroadcast last', '/deletebroadcast all', '', 'Default: /deletebroadcast deletes the last broadcast.'].join('\n'));
+    return;
+  }
+
+  const history = readBroadcastHistory();
+  const broadcasts = history.broadcasts || [];
+
+  if (!broadcasts.length) {
+    await ctx.reply('No saved broadcast messages found to delete.');
+    return;
+  }
+
+  const targets = mode === 'all' ? broadcasts : [broadcasts[broadcasts.length - 1]];
+  const totalMessages = targets.reduce((sum, item) => sum + (item.messages?.length || 0), 0);
+  await ctx.reply(`Deleting ${mode === 'all' ? 'all broadcasts' : 'last broadcast'} from ${totalMessages} chat message(s)...`);
+
+  let deleted = 0;
+  let failed = 0;
+  const failures = [];
+
+  for (const broadcast of targets) {
+    for (const item of broadcast.messages || []) {
+      try {
+        await ctx.telegram.deleteMessage(item.chatId, item.messageId);
+        deleted += 1;
+      } catch (error) {
+        failed += 1;
+        failures.push(`${item.chatId}/${item.messageId}: ${error.message}`);
+        console.error(`Delete broadcast failed for ${item.chatId}/${item.messageId}:`, error.message);
+      }
+      if (BROADCAST_THROTTLE_MS > 0) await sleep(BROADCAST_THROTTLE_MS);
+    }
+  }
+
+  updateBroadcastHistoryAfterDelete(mode, targets.map((item) => item.broadcastId));
+
+  await ctx.reply([
+    '✅ Broadcast cleanup completed.',
+    `Mode: ${mode}`,
+    `Deleted: ${deleted}`,
+    `Failed: ${failed}`,
+    failures.length ? `Failures:\n${failures.slice(0, 10).join('\n')}` : '',
+  ].filter(Boolean).join('\n'));
+}
 function ensureAdminPrivate(ctx) {
   const userId = Number(ctx.from?.id);
   const isAdmin = ADMIN_IDS.includes(userId) || isTeamMember(userId);
