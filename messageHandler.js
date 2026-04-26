@@ -32,7 +32,7 @@ import { embedText } from './embed.js';
 import { notifyTeamAboutSuggestion, markSuggestionCardsHandled } from './notifications.js';
 import { findPartnerCandidates, getProjectProfileForUser, getRelevantKnowledge } from './rag.js';
 import * as sheetsApi from './sheets.js';
-import { buildChatLink, displayName, normalizeTelegramUsername, parseLocalDateTimeInput, sha256 } from './utils.js';
+import { buildChatLink, displayName, formatMonospaceBlock, normalizeTelegramUsername, parseLocalDateTimeInput, sha256 } from './utils.js';
 import {
   extractAnnouncementReminderCandidate,
   generateBDSuggestion,
@@ -134,7 +134,7 @@ export async function handleIncomingMessage(ctx) {
 async function handleForwardedPrivateReply({ telegram, chatId, forwardedText }) {
   await telegram.sendMessage(chatId, 'Generating trained reply...');
   const result = await buildTrainedReply(forwardedText);
-  await telegram.sendMessage(chatId, result.reply, { disable_web_page_preview: true });
+  await telegram.sendMessage(chatId, formatMonospaceBlock(result.reply), { parse_mode: 'HTML', disable_web_page_preview: true });
 }
 
 function isForwardedMessage(message) {
