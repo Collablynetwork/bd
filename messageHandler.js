@@ -1,4 +1,5 @@
 import { RESERVED_PRIVATE_TEXTS, buildTrainedReply } from './commands.js';
+import { saveLastForwardedReply } from './replyState.js';
 import { ANNOUNCEMENT_REMINDER_LEAD_MINUTES, BOT_NAME } from './config.js';
 import {
   addKnowledgeItem,
@@ -134,7 +135,13 @@ export async function handleIncomingMessage(ctx) {
 async function handleForwardedPrivateReply({ telegram, chatId, forwardedText }) {
   await telegram.sendMessage(chatId, 'Generating trained reply...');
   const result = await buildTrainedReply(forwardedText);
-  await telegram.sendMessage(chatId, formatMonospaceBlock(result.reply), { parse_mode: 'HTML', disable_web_page_preview: true });
+  const sent = await telegram.sendMessage(chatId, formatMonospaceBlock(result.reply), { parse_mode: 'HTML', disable_web_page_preview: true });
+  saveLastForwardedReply({
+    chatId,
+    forwardedText,
+    generatedReply: result.reply,
+    botMessageId: sent?.message_id,
+  });
 }
 
 function isForwardedMessage(message) {

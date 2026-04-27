@@ -41,6 +41,7 @@ import {
 } from './db.js';
 import { embedText } from './embed.js';
 import { generatePartnerRecommendations, generateProjectStatusAdvice, generateTrainedReply } from './ai.js';
+import { getLastForwardedReply, saveLastForwardedReply } from './replyState.js';
 import { writeHistoryExportFiles } from './history.js';
 import { findPartnerCandidates } from './rag.js';
 import { buildDailyKnowledge } from './scheduler.js';
@@ -93,6 +94,7 @@ const BOT_COMMANDS = [
   { command: 'refreshservices', description: 'Reload the Collably service dataset from Sheets' },
   { command: 'hidemenu', description: 'Hide the private menu keyboard' },
   { command: 'reply', description: 'Generate trained reply for a message' },
+  { command: 'ins', description: 'Improve last forwarded reply with extra context' },
   { command: 'broadcast', description: 'Admin: broadcast a message to all known groups' },
   { command: 'importgroups', description: 'Admin: import group chat IDs for broadcast' },
   { command: 'deletebroadcast', description: 'Admin: delete last/all broadcast messages' },
@@ -189,6 +191,7 @@ export function registerCommands(bot) {
   bot.command('addcollablyteam', handleAddCollablyTeam);
   bot.command('hidemenu', handleHideMenu);
   bot.command('reply', handleReply);
+  bot.command('ins', handleIns);
   bot.command('broadcast', handleBroadcast);
   bot.command('importgroups', handleImportGroups);
   bot.command('deletebroadcast', handleDeleteBroadcast);
@@ -1085,6 +1088,49 @@ export async function buildTrainedReply(incomingMessage) {
   });
 }
 
+
+async function handleIns(ctx) {
+  if (!isTeamMember(Number(ctx.from?.id))) {
+    await ctx.reply('Not allowed.');
+    return;
+  }
+
+  const extraContext = normalizeCommandPayload(ctx.message?.text || '', '/ins').trim();
+  if (!extraContext) {
+    await ctx.reply('Usage: /ins previous discussion context here');
+    return;
+  }
+
+  const last = getLastForwardedReply(ctx.chat?.id);
+  if (!last?.forwardedText) {
+    await ctx.reply('No forwarded message found yet. First forward the message to this bot, then use /ins with extra context.');
+    return;
+  }
+
+  await ctx.reply('Regenerating trained reply with your added context...');
+
+  const regeneratedInput = [
+    'Original forwarded message:',
+    last.forwardedText,
+    '',
+    'Previous generated Collably reply:',
+    last.generatedReply || 'No previous generated reply saved.',
+    '',
+    'Additional previous discussion/context provided by Collably team:',
+    extraContext,
+    '',
+    'Task: Regenerate the best reply to the original forwarded message using the additional context above. Do not reply to the extra context directly.',
+  ].join('\n');
+
+  const result = await buildTrainedReply(regeneratedInput);
+  const sent = await ctx.reply(formatMonospaceBlock(result.reply), { parse_mode: 'HTML', disable_web_page_preview: true });
+  saveLastForwardedReply({
+    chatId: ctx.chat.id,
+    forwardedText: last.forwardedText,
+    generatedReply: result.reply,
+    botMessageId: sent?.message_id,
+  });
+}
 async function handleBroadcast(ctx) {
   if (!ensureAdminPrivate(ctx)) return;
 
