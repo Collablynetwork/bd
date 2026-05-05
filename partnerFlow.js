@@ -140,14 +140,26 @@ function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-async function sendNoMoreMatches(bot, chatId) {
-  await bot.telegram.sendMessage(
+function getTelegramClient(botOrTelegram) {
+  if (botOrTelegram?.telegram?.sendMessage) return botOrTelegram.telegram;
+  if (botOrTelegram?.sendMessage) return botOrTelegram;
+  return null;
+}
+
+async function sendNoMoreMatches(botOrTelegram, chatId) {
+  const telegram = getTelegramClient(botOrTelegram);
+  if (!telegram) throw new Error('Telegram client is unavailable.');
+
+  await telegram.sendMessage(
     chatId,
     'We have no more matches for your project right now. We’ll notify you as soon as new potential partners are available.',
   );
 }
 
-async function sendMessageToGroup(bot, chatId, projectData) {
+async function sendMessageToGroup(botOrTelegram, chatId, projectData) {
+  const telegram = getTelegramClient(botOrTelegram);
+  if (!telegram) throw new Error('Telegram client is unavailable.');
+
   const message = `
 Please review your Potential partner:
 
@@ -157,7 +169,7 @@ Twitter Link: ${projectData.twitterLink}
 Would you like to proceed with a partnership with the project?
   `;
 
-  return bot.telegram.sendMessage(chatId, message, {
+  return telegram.sendMessage(chatId, message, {
     reply_markup: {
       inline_keyboard: [
         [{ text: 'Yes', callback_data: `YES_${projectData.groupId}_${projectData.projectName}_${chatId}` }],
@@ -167,21 +179,24 @@ Would you like to proceed with a partnership with the project?
   });
 }
 
-async function sendRandomPartner(bot, chatId) {
+async function sendRandomPartner(botOrTelegram, chatId) {
+  const telegram = getTelegramClient(botOrTelegram);
   try {
+    if (!telegram) throw new Error('Telegram client is unavailable.');
+
     const state = ensureChatState(chatId);
     if (!state.projectSendingEnabled) return;
 
     const trackingData = await fetchPartnerSheetData('Partnership Tracking Projects');
     if (!trackingData.length) {
-      await sendNoMoreMatches(bot, chatId);
+      await sendNoMoreMatches(telegram, chatId);
       return;
     }
 
     const header = trackingData[0];
     const premiumIndex = header.findIndex((value) => String(value) === String(chatId));
     if (premiumIndex === -1) {
-      await bot.telegram.sendMessage(chatId, "We couldn't find your Group ID in Partnership Tracking Projects header Row 1.");
+      await telegram.sendMessage(chatId, "We couldn't find your Group ID in Partnership Tracking Projects header Row 1.");
       return;
     }
 
@@ -200,7 +215,7 @@ async function sendRandomPartner(bot, chatId) {
     }
 
     if (!candidates.length) {
-      await sendNoMoreMatches(bot, chatId);
+      await sendNoMoreMatches(telegram, chatId);
       return;
     }
 
@@ -212,16 +227,18 @@ async function sendRandomPartner(bot, chatId) {
     });
 
     if (!fresh.length) {
-      await sendNoMoreMatches(bot, chatId);
+      await sendNoMoreMatches(telegram, chatId);
       return;
     }
 
     const selected = pickRandom(fresh);
-    await sendMessageToGroup(bot, chatId, selected);
+    await sendMessageToGroup(telegram, chatId, selected);
     await markShown(chatId, selected.groupId);
   } catch (error) {
     console.error('sendRandomPartner error:', error);
-    await bot.telegram.sendMessage(chatId, `Partner matching failed: ${error.message}`);
+    if (telegram) {
+      await telegram.sendMessage(chatId, `Partner matching failed: ${error.message}`).catch(() => {});
+    }
   }
 }
 
@@ -252,8 +269,10 @@ function stopAllForChat(chatId) {
   return false;
 }
 
-async function sendWeeklyUpdate(bot, chatId) {
-  await bot.telegram.sendMessage(chatId, weeklyMessage);
+async function sendWeeklyUpdate(botOrTelegram, chatId) {
+  const telegram = getTelegramClient(botOrTelegram);
+  if (!telegram) throw new Error('Telegram client is unavailable.');
+  await telegram.sendMessage(chatId, weeklyMessage);
 }
 
 function scheduleWeekly(bot, chatId) {
